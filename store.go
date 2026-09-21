@@ -1,30 +1,62 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
+const (
+	RoleAdmin  = "admin"
+	RoleViewer = "viewer"
+
+	accessTokenTTL  = 12 * time.Hour
+	refreshTokenTTL = 30 * 24 * time.Hour
+
+	// pbkdf2Iterations follows OWASP's current guidance for PBKDF2-HMAC-SHA256.
+	pbkdf2Iterations = 210000
+	pbkdf2KeyLength  = 32
+)
+
+var (
+	ErrInvalidCredentials = errors.New("invalid credentials")
+	ErrSessionInvalid     = errors.New("session invalid")
+)
+
 type Addon struct {
-	ID          string         `json:"id"`
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Version     string         `json:"version,omitempty"`
-	ManifestURL string         `json:"manifestURL"`
-	BaseURL     string         `json:"baseURL"`
-	Resources   []string       `json:"resources,omitempty"`
-	Catalogs    []AddonCatalog `json:"catalogs,omitempty"`
-	Enabled     bool           `json:"enabled"`
-	AddedAt     time.Time      `json:"addedAt"`
+	ID           string         `json:"id"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description,omitempty"`
+	Version      string         `json:"version,omitempty"`
+	ManifestURL  string         `json:"manifestURL"`
+	BaseURL      string         `json:"baseURL"`
+	ConfigureURL string         `json:"configureURL,omitempty"`
+	Resources    []string       `json:"resources,omitempty"`
+	Catalogs     []AddonCatalog `json:"catalogs,omitempty"`
+	Enabled      bool           `json:"enabled"`
+	AddedAt      time.Time      `json:"addedAt"`
+
+	// Health reflects the addon's own reachability, kept separate from
+	// Enabled: enabled/disabled is an admin choice, health is what the hub
+	// has observed. Never populated from anything but the hub's own calls,
+	// and LastError is a sanitized, addon-safe message — never a raw error
+	// that might echo back a manifest URL or query-string credential.
+	Reachable     bool       `json:"reachable"`
+	LastSuccessAt *time.Time `json:"lastSuccessAt,omitempty"`
+	LastErrorAt   *time.Time `json:"lastErrorAt,omitempty"`
+	LastError     string     `json:"lastError,omitempty"`
 }
 
 type AddonCatalog struct {
@@ -34,18 +66,42 @@ type AddonCatalog struct {
 	Extra []string `json:"extra,omitempty"`
 }
 
-type State struct {
-	NodeID  string   `json:"nodeID"`
-	Addons  []Addon  `json:"addons"`
-	Viewers []Viewer `json:"viewers,omitempty"`
+// User is an authenticated account on the hub: either the private admin
+// account or a personal viewing account used by a Veyra client.
+type User struct {
+	ID           string    `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"passwordHash"`
+	Role         string    `json:"role"`
+	Enabled      bool      `json:"enabled"`
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
-type Viewer struct {
-	ID        string    `json:"id"`
-	Username  string    `json:"username"`
-	TokenHash string    `json:"tokenHash,omitempty"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"createdAt"`
+// Session is one logged-in device for a user. Only hashes of the access and
+// refresh tokens are persisted; the plain tokens are returned once, at
+// login/refresh time, and never stored.
+type Session struct {
+	ID               string     `json:"id"`
+	UserID           string     `json:"userID"`
+	DeviceID         string     `json:"deviceID"`
+	DeviceName       string     `json:"deviceName,omitempty"`
+	AccessTokenHash  string     `json:"accessTokenHash"`
+	RefreshTokenHash string     `json:"refreshTokenHash"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	AccessExpiresAt  time.Time  `json:"accessExpiresAt"`
+	RefreshExpiresAt time.Time  `json:"refreshExpiresAt"`
+	RevokedAt        *time.Time `json:"revokedAt,omitempty"`
+}
+
+func (s Session) active(now time.Time) bool {
+	return s.RevokedAt == nil && now.Before(s.RefreshExpiresAt)
+}
+
+type State struct {
+	NodeID   string    `json:"nodeID"`
+	Addons   []Addon   `json:"addons"`
+	Users    []User    `json:"users,omitempty"`
+	Sessions []Session `json:"sessions,omitempty"`
 }
 
 type Store struct {
@@ -78,73 +134,282 @@ func (s *Store) Snapshot() State {
 	defer s.mu.RUnlock()
 	copyState := s.state
 	copyState.Addons = append([]Addon{}, s.state.Addons...)
-	copyState.Viewers = append([]Viewer{}, s.state.Viewers...)
+	copyState.Users = append([]User{}, s.state.Users...)
+	copyState.Sessions = append([]Session{}, s.state.Sessions...)
 	return copyState
 }
 
-func (s *Store) AddViewer(username string) (Viewer, string, error) {
+// HasUsers reports whether any account has been created yet, used to decide
+// whether to bootstrap the initial admin account on startup.
+func (s *Store) HasUsers() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.state.Users) > 0
+}
+
+// CreateUser creates a new account with a hashed password. Returns
+// os.ErrExist if the username is already taken.
+func (s *Store) CreateUser(username, password, role string) (User, error) {
+	hash, err := hashPassword(password)
+	if err != nil {
+		return User{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, viewer := range s.state.Viewers {
-		if strings.EqualFold(viewer.Username, username) {
-			return Viewer{}, "", os.ErrExist
+	for _, user := range s.state.Users {
+		if strings.EqualFold(user.Username, username) {
+			return User{}, os.ErrExist
 		}
 	}
-	token := randomToken()
-	viewer := Viewer{ID: randomID(), Username: username, TokenHash: tokenHash(token), Enabled: true, CreatedAt: time.Now().UTC()}
-	s.state.Viewers = append(s.state.Viewers, viewer)
+	user := User{
+		ID: randomID(), Username: username, PasswordHash: hash,
+		Role: role, Enabled: true, CreatedAt: time.Now().UTC(),
+	}
+	s.state.Users = append(s.state.Users, user)
 	if err := s.persistLocked(); err != nil {
-		return Viewer{}, "", err
+		return User{}, err
 	}
-	return viewer, token, nil
+	return user, nil
 }
 
-func (s *Store) SetViewerEnabled(id string, enabled bool) error {
+func (s *Store) SetUserEnabled(id string, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.state.Viewers {
-		if s.state.Viewers[i].ID == id {
-			s.state.Viewers[i].Enabled = enabled
+	for i := range s.state.Users {
+		if s.state.Users[i].ID == id {
+			s.state.Users[i].Enabled = enabled
 			return s.persistLocked()
 		}
 	}
 	return os.ErrNotExist
 }
 
-func (s *Store) DeleteViewer(id string) error {
+// SetUserPassword replaces a user's password (used by admin-initiated
+// resets). Existing sessions are left as-is; call RevokeUserSessions
+// separately if they should be signed out.
+func (s *Store) SetUserPassword(id, password string) error {
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.state.Viewers {
-		if s.state.Viewers[i].ID == id {
-			s.state.Viewers = append(s.state.Viewers[:i], s.state.Viewers[i+1:]...)
+	for i := range s.state.Users {
+		if s.state.Users[i].ID == id {
+			s.state.Users[i].PasswordHash = hash
 			return s.persistLocked()
 		}
 	}
 	return os.ErrNotExist
 }
 
-func (s *Store) AuthenticateViewer(username, token string) (Viewer, bool) {
-	wantedHash := tokenHash(token)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, viewer := range s.state.Viewers {
-		if viewer.Enabled && strings.EqualFold(viewer.Username, username) && secureHashEqual(viewer.TokenHash, wantedHash) {
-			return viewer, true
+func (s *Store) DeleteUser(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	found := false
+	for i := range s.state.Users {
+		if s.state.Users[i].ID == id {
+			s.state.Users = append(s.state.Users[:i], s.state.Users[i+1:]...)
+			found = true
+			break
 		}
 	}
-	return Viewer{}, false
+	if !found {
+		return os.ErrNotExist
+	}
+	kept := s.state.Sessions[:0]
+	for _, session := range s.state.Sessions {
+		if session.UserID != id {
+			kept = append(kept, session)
+		}
+	}
+	s.state.Sessions = kept
+	return s.persistLocked()
 }
 
-func (s *Store) ViewerForToken(token string) (Viewer, bool) {
-	wantedHash := tokenHash(token)
+// UserByID looks up a user by id (locked; safe to call from HTTP handlers).
+func (s *Store) UserByID(id string) (User, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, viewer := range s.state.Viewers {
-		if viewer.Enabled && secureHashEqual(viewer.TokenHash, wantedHash) {
-			return viewer, true
+	return s.userByID(id)
+}
+
+func (s *Store) userByID(id string) (User, bool) {
+	for _, user := range s.state.Users {
+		if user.ID == id {
+			return user, true
 		}
 	}
-	return Viewer{}, false
+	return User{}, false
+}
+
+// Authenticate checks a username/password pair against stored accounts.
+func (s *Store) Authenticate(username, password string) (User, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, user := range s.state.Users {
+		if !strings.EqualFold(user.Username, username) {
+			continue
+		}
+		if !user.Enabled {
+			return User{}, false
+		}
+		if !verifyPassword(user.PasswordHash, password) {
+			return User{}, false
+		}
+		return user, true
+	}
+	return User{}, false
+}
+
+// CreateSession issues a fresh access/refresh token pair for a device and
+// persists only their hashes.
+func (s *Store) CreateSession(userID, deviceID, deviceName string) (Session, string, string, error) {
+	if deviceID == "" {
+		deviceID = randomID()
+	}
+	accessToken := randomToken()
+	refreshToken := randomToken()
+	now := time.Now().UTC()
+	session := Session{
+		ID: randomID(), UserID: userID, DeviceID: deviceID, DeviceName: deviceName,
+		AccessTokenHash: tokenHash(accessToken), RefreshTokenHash: tokenHash(refreshToken),
+		CreatedAt: now, AccessExpiresAt: now.Add(accessTokenTTL), RefreshExpiresAt: now.Add(refreshTokenTTL),
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.Sessions = append(s.state.Sessions, session)
+	if err := s.persistLocked(); err != nil {
+		return Session{}, "", "", err
+	}
+	return session, accessToken, refreshToken, nil
+}
+
+// SessionByAccessToken resolves a live session and its user from a bearer
+// access token. Expired or revoked sessions, and sessions for a disabled or
+// deleted user, are rejected.
+func (s *Store) SessionByAccessToken(token string) (Session, User, bool) {
+	if token == "" {
+		return Session{}, User{}, false
+	}
+	wantedHash := tokenHash(token)
+	now := time.Now().UTC()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, session := range s.state.Sessions {
+		if !secureHashEqual(session.AccessTokenHash, wantedHash) {
+			continue
+		}
+		if session.RevokedAt != nil || now.After(session.AccessExpiresAt) {
+			return Session{}, User{}, false
+		}
+		user, ok := s.userByID(session.UserID)
+		if !ok || !user.Enabled {
+			return Session{}, User{}, false
+		}
+		return session, user, true
+	}
+	return Session{}, User{}, false
+}
+
+// RefreshSession rotates a session's tokens given a valid, unexpired refresh
+// token, extending the device's login without asking for the password again.
+func (s *Store) RefreshSession(refreshToken string) (Session, User, string, string, error) {
+	wantedHash := tokenHash(refreshToken)
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Sessions {
+		session := &s.state.Sessions[i]
+		if !secureHashEqual(session.RefreshTokenHash, wantedHash) {
+			continue
+		}
+		if !session.active(now) {
+			return Session{}, User{}, "", "", ErrSessionInvalid
+		}
+		user, ok := s.userByID(session.UserID)
+		if !ok || !user.Enabled {
+			return Session{}, User{}, "", "", ErrSessionInvalid
+		}
+		accessToken := randomToken()
+		refreshTokenNew := randomToken()
+		session.AccessTokenHash = tokenHash(accessToken)
+		session.RefreshTokenHash = tokenHash(refreshTokenNew)
+		session.AccessExpiresAt = now.Add(accessTokenTTL)
+		session.RefreshExpiresAt = now.Add(refreshTokenTTL)
+		if err := s.persistLocked(); err != nil {
+			return Session{}, User{}, "", "", err
+		}
+		return *session, user, accessToken, refreshTokenNew, nil
+	}
+	return Session{}, User{}, "", "", ErrSessionInvalid
+}
+
+// RevokeSession signs a single device out. Only the session owner or an
+// admin should be allowed to call this (enforced by the HTTP layer).
+func (s *Store) RevokeSession(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Sessions {
+		if s.state.Sessions[i].ID == id {
+			if s.state.Sessions[i].RevokedAt != nil {
+				return nil
+			}
+			now := time.Now().UTC()
+			s.state.Sessions[i].RevokedAt = &now
+			return s.persistLocked()
+		}
+	}
+	return os.ErrNotExist
+}
+
+// RevokeUserSessions signs every device for a user out at once, e.g. after a
+// password reset.
+func (s *Store) RevokeUserSessions(userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	changed := false
+	for i := range s.state.Sessions {
+		if s.state.Sessions[i].UserID == userID && s.state.Sessions[i].RevokedAt == nil {
+			s.state.Sessions[i].RevokedAt = &now
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.persistLocked()
+}
+
+// SessionsForUser lists the live (non-expired, non-revoked) sessions for a
+// user, i.e. their signed-in devices.
+func (s *Store) SessionsForUser(userID string) []Session {
+	now := time.Now().UTC()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []Session
+	for _, session := range s.state.Sessions {
+		if session.UserID == userID && session.active(now) {
+			result = append(result, session)
+		}
+	}
+	return result
+}
+
+// AllSessions lists every live session across all users, for the admin
+// dashboard.
+func (s *Store) AllSessions() []Session {
+	now := time.Now().UTC()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []Session
+	for _, session := range s.state.Sessions {
+		if session.active(now) {
+			result = append(result, session)
+		}
+	}
+	return result
 }
 
 func (s *Store) PutAddon(addon Addon) error {
@@ -171,6 +436,33 @@ func (s *Store) SetEnabled(id string, enabled bool) error {
 		}
 	}
 	return os.ErrNotExist
+}
+
+// RecordAddonHealth updates an addon's observed reachability after the hub
+// calls it (a catalog, meta, or stream request). success/failure are
+// recorded independently so a dashboard can show "reachable but last call
+// failed" or vice versa. message is a short, already-sanitized description
+// (no addon URLs or query strings); callers must sanitize before passing it.
+// A miss (addon deleted concurrently) is silently ignored: health is
+// best-effort telemetry, not something a caller should fail over.
+func (s *Store) RecordAddonHealth(id string, ok bool, message string) {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Addons {
+		if s.state.Addons[i].ID != id {
+			continue
+		}
+		s.state.Addons[i].Reachable = ok
+		if ok {
+			s.state.Addons[i].LastSuccessAt = &now
+		} else {
+			s.state.Addons[i].LastErrorAt = &now
+			s.state.Addons[i].LastError = message
+		}
+		_ = s.persistLocked()
+		return
+	}
 }
 
 func (s *Store) DeleteAddon(id string) error {
@@ -240,4 +532,68 @@ func tokenHash(token string) string {
 
 func secureHashEqual(a, b string) bool {
 	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// hashPassword derives a salted PBKDF2-HMAC-SHA256 hash for storage, encoded
+// as "pbkdf2-sha256$<iterations>$<saltHex>$<hashHex>". Implemented against
+// the standard library only (no golang.org/x/crypto) since this environment
+// cannot reach the Go module proxy.
+func hashPassword(password string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	derived := pbkdf2HMACSHA256([]byte(password), salt, pbkdf2Iterations, pbkdf2KeyLength)
+	return fmt.Sprintf("pbkdf2-sha256$%d$%s$%s", pbkdf2Iterations, hex.EncodeToString(salt), hex.EncodeToString(derived)), nil
+}
+
+// verifyPassword checks a plaintext password against an encoded hash
+// produced by hashPassword, in constant time.
+func verifyPassword(encoded, password string) bool {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" {
+		return false
+	}
+	iterations, err := strconv.Atoi(parts[1])
+	if err != nil || iterations <= 0 {
+		return false
+	}
+	salt, err := hex.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	wanted, err := hex.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	got := pbkdf2HMACSHA256([]byte(password), salt, iterations, len(wanted))
+	return subtle.ConstantTimeCompare(got, wanted) == 1
+}
+
+// pbkdf2HMACSHA256 implements PBKDF2 (RFC 8018) with HMAC-SHA256 as the PRF.
+func pbkdf2HMACSHA256(password, salt []byte, iterations, keyLength int) []byte {
+	prf := hmac.New(sha256.New, password)
+	hashLength := prf.Size()
+	numBlocks := (keyLength + hashLength - 1) / hashLength
+	derived := make([]byte, 0, numBlocks*hashLength)
+	blockIndex := make([]byte, 4)
+	for block := 1; block <= numBlocks; block++ {
+		prf.Reset()
+		prf.Write(salt)
+		binary.BigEndian.PutUint32(blockIndex, uint32(block))
+		prf.Write(blockIndex)
+		u := prf.Sum(nil)
+		t := make([]byte, len(u))
+		copy(t, u)
+		for i := 1; i < iterations; i++ {
+			prf.Reset()
+			prf.Write(u)
+			u = prf.Sum(nil)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		derived = append(derived, t...)
+	}
+	return derived[:keyLength]
 }

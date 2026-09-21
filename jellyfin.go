@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -80,39 +79,53 @@ func (h *Hub) jellyfinAuthenticate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "Gebruikersnaam of wachtwoord onjuist.")
 		return
 	}
-	state := h.store.Snapshot()
-	userID := ""
-	username := ""
-	if secureEqual(input.Username, h.username) && secureEqual(input.Password, h.token) {
-		userID = state.NodeID
-		username = h.username
-	} else if viewer, ok := h.store.AuthenticateViewer(input.Username, input.Password); ok {
-		userID = viewer.ID
-		username = viewer.Username
-	} else {
+	user, ok := h.store.Authenticate(strings.TrimSpace(input.Username), input.Password)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "Gebruikersnaam of wachtwoord onjuist.")
 		return
 	}
+	fields := embyAuthFields(r.Header.Get("X-Emby-Authorization"))
+	session, accessToken, _, err := h.store.CreateSession(user.ID, fields["DeviceId"], fields["Device"])
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Aanmelden is mislukt.")
+		return
+	}
+	state := h.store.Snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"User":        map[string]any{"Id": userID, "Name": username},
-		"AccessToken": input.Password, "ServerId": state.NodeID,
+		"User":        map[string]any{"Id": user.ID, "Name": user.Username},
+		"AccessToken": accessToken, "ServerId": state.NodeID,
 	})
+	_ = session
 }
 
 func (h *Hub) jellyfinProtected(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := jellyfinToken(r)
-		if secureEqual(token, h.token) {
-			next(w, r)
-			return
-		}
-		viewer, ok := h.store.ViewerForToken(token)
-		if !ok || (r.PathValue("userID") != "" && r.PathValue("userID") != viewer.ID) {
+		_, user, ok := h.store.SessionByAccessToken(token)
+		if !ok || (r.PathValue("userID") != "" && r.PathValue("userID") != user.ID) {
 			writeError(w, http.StatusUnauthorized, "Een geldige mediaserversessie is vereist.")
 			return
 		}
 		next(w, r)
 	}
+}
+
+// embyAuthFields parses the "X-Emby-Authorization" header Jellyfin/Emby
+// clients send, e.g. `MediaBrowser Client="Veyra", Device="iPhone",
+// DeviceId="abc", Version="1.0"`, into a key/value map.
+func embyAuthFields(header string) map[string]string {
+	fields := map[string]string{}
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		eq := strings.Index(part, "=")
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(part[:eq])
+		value := strings.Trim(strings.TrimSpace(part[eq+1:]), "\"")
+		fields[key] = value
+	}
+	return fields
 }
 
 func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
@@ -259,16 +272,24 @@ func (h *Hub) fetchCatalog(ctx context.Context, addon Addon, catalog AddonCatalo
 	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
 	response, err := h.client.Do(request)
 	if err != nil {
+		h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
 		return nil, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return nil, fmt.Errorf("catalog HTTP %d", response.StatusCode)
+		err := fmt.Errorf("catalog HTTP %d", response.StatusCode)
+		h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+		return nil, err
 	}
 	var payload struct {
 		Metas []stremioMeta `json:"metas"`
 	}
 	err = json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&payload)
+	if err != nil {
+		h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+	} else {
+		h.store.RecordAddonHealth(addon.ID, true, "")
+	}
 	return payload.Metas, err
 }
 
@@ -422,10 +443,6 @@ func jellyfinToken(r *http.Request) string {
 		}
 	}
 	return ""
-}
-
-func secureEqual(a, b string) bool {
-	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func queryInt(r *http.Request, key string, fallback int) int {

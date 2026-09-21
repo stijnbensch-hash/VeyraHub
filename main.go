@@ -20,13 +20,17 @@ func main() {
 	var (
 		address  = flag.String("addr", envOr("VEYRA_HUB_ADDRESS", ":8787"), "listen address")
 		dataDir  = flag.String("data", envOr("VEYRA_HUB_DATA", "./data"), "persistent data directory")
-		username = flag.String("username", envOr("VEYRA_HUB_USERNAME", "admin"), "media server username")
-		token    = flag.String("token", os.Getenv("VEYRA_HUB_TOKEN"), "API token (or VEYRA_HUB_TOKEN)")
+		username = flag.String("username", envOr("VEYRA_HUB_USERNAME", "admin"), "initial admin username (only used to bootstrap the first account)")
+		token    = flag.String("token", os.Getenv("VEYRA_HUB_TOKEN"), "initial admin password (or VEYRA_HUB_TOKEN); only used to bootstrap the first account")
 	)
 	flag.Parse()
 
 	if *token == "" {
 		fmt.Fprintln(os.Stderr, "VEYRA_HUB_TOKEN is required")
+		os.Exit(2)
+	}
+	if len(*token) < minPasswordLength {
+		fmt.Fprintf(os.Stderr, "VEYRA_HUB_TOKEN must be at least %d characters\n", minPasswordLength)
 		os.Exit(2)
 	}
 

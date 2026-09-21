@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -23,10 +22,11 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
+const minPasswordLength = 8
+
 type Hub struct {
 	store    *Store
 	username string
-	token    string
 	client   *http.Client
 }
 
@@ -44,6 +44,10 @@ type addonManifest struct {
 			Name string `json:"name"`
 		} `json:"extra"`
 	} `json:"catalogs"`
+	BehaviorHints struct {
+		Configurable          bool `json:"configurable"`
+		ConfigurationRequired bool `json:"configurationRequired"`
+	} `json:"behaviorHints"`
 }
 
 type streamResponse struct {
@@ -61,41 +65,101 @@ type HubStream struct {
 	VideoSize   int64  `json:"videoSize,omitempty"`
 }
 
-func NewHub(store *Store, username, token string, client *http.Client) *Hub {
+// HubSubtitle is a subtitle track offered by a subtitle-capable addon.
+// Subtitles are their own capability (not part of HubStream) so any number
+// of subtitle addons can contribute tracks for a title independently of
+// which addon resolved the video stream itself.
+type HubSubtitle struct {
+	AddonID   string `json:"addonID"`
+	AddonName string `json:"addonName"`
+	Lang      string `json:"lang,omitempty"`
+	Name      string `json:"name,omitempty"`
+	URL       string `json:"url"`
+}
+
+type subtitleResponse struct {
+	Subtitles []json.RawMessage `json:"subtitles"`
+}
+
+type ctxKey string
+
+const (
+	ctxUserKey    ctxKey = "user"
+	ctxSessionKey ctxKey = "session"
+)
+
+// NewHub wires up the hub's HTTP handlers. bootstrapUsername/bootstrapPassword
+// are used once, on first run, to create the initial admin account when the
+// store holds no users yet; after that the admin signs in like any other
+// account and these values are ignored.
+func NewHub(store *Store, bootstrapUsername, bootstrapPassword string, client *http.Client) *Hub {
 	if client == nil {
 		client = &http.Client{Timeout: 25 * time.Second}
 	}
-	return &Hub{store: store, username: username, token: token, client: client}
+	if !store.HasUsers() {
+		if _, err := store.CreateUser(bootstrapUsername, bootstrapPassword, RoleAdmin); err != nil {
+			slog.Error("cannot bootstrap admin account", "error", err)
+		}
+	}
+	return &Hub{store: store, username: bootstrapUsername, client: client}
 }
 
 func (h *Hub) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", h.index)
 	mux.HandleFunc("GET /health", h.health)
-	mux.HandleFunc("GET /v1/status", h.auth(h.status))
-	mux.HandleFunc("GET /v1/addons", h.auth(h.listAddons))
-	mux.HandleFunc("POST /v1/addons", h.auth(h.addAddon))
-	mux.HandleFunc("PATCH /v1/addons/{id}", h.auth(h.patchAddon))
-	mux.HandleFunc("POST /v1/addons/{id}/move", h.auth(h.moveAddon))
-	mux.HandleFunc("DELETE /v1/addons/{id}", h.auth(h.deleteAddon))
-	mux.HandleFunc("GET /v1/users", h.auth(h.listUsers))
-	mux.HandleFunc("POST /v1/users", h.auth(h.addUser))
-	mux.HandleFunc("PATCH /v1/users/{id}", h.auth(h.patchUser))
-	mux.HandleFunc("DELETE /v1/users/{id}", h.auth(h.deleteUser))
-	mux.HandleFunc("GET /v1/streams/{type}/{id}", h.auth(h.streams))
+	mux.HandleFunc("POST /v1/auth/login", h.login)
+	mux.HandleFunc("POST /v1/auth/refresh", h.refreshToken)
+	mux.HandleFunc("POST /v1/auth/logout", h.requireSession(h.logout))
+	mux.HandleFunc("GET /v1/status", h.requireAdmin(h.status))
+	mux.HandleFunc("GET /v1/sessions", h.requireAdmin(h.listSessions))
+	mux.HandleFunc("DELETE /v1/sessions/{id}", h.requireAdmin(h.revokeSession))
+	mux.HandleFunc("GET /v1/addons", h.requireAdmin(h.listAddons))
+	mux.HandleFunc("POST /v1/addons", h.requireAdmin(h.addAddon))
+	mux.HandleFunc("PATCH /v1/addons/{id}", h.requireAdmin(h.patchAddon))
+	mux.HandleFunc("POST /v1/addons/{id}/move", h.requireAdmin(h.moveAddon))
+	mux.HandleFunc("DELETE /v1/addons/{id}", h.requireAdmin(h.deleteAddon))
+	mux.HandleFunc("GET /v1/users", h.requireAdmin(h.listUsers))
+	mux.HandleFunc("POST /v1/users", h.requireAdmin(h.addUser))
+	mux.HandleFunc("PATCH /v1/users/{id}", h.requireAdmin(h.patchUser))
+	mux.HandleFunc("DELETE /v1/users/{id}", h.requireAdmin(h.deleteUser))
+	mux.HandleFunc("GET /v1/streams/{type}/{id}", h.requireAdmin(h.streams))
+	mux.HandleFunc("GET /v1/subtitles/{type}/{id}", h.requireAdmin(h.subtitles))
 	h.registerJellyfinRoutes(mux)
 	return securityHeaders(mux)
 }
 
-func (h *Hub) auth(next http.HandlerFunc) http.HandlerFunc {
+// requireSession accepts any signed-in account (admin or viewer) and makes
+// the resolved session/user available to the handler via the request context.
+func (h *Hub) requireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-		if len(provided) != len(h.token) || subtle.ConstantTimeCompare([]byte(provided), []byte(h.token)) != 1 {
-			writeError(w, http.StatusUnauthorized, "Een geldig API-token is vereist.")
+		token := bearerToken(r)
+		session, user, ok := h.store.SessionByAccessToken(token)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "Een geldige sessie is vereist. Log opnieuw in.")
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxUserKey, user)
+		ctx = context.WithValue(ctx, ctxSessionKey, session)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// requireAdmin is like requireSession but additionally requires the admin role,
+// for the hub's own management API.
+func (h *Hub) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return h.requireSession(func(w http.ResponseWriter, r *http.Request) {
+		user, _ := r.Context().Value(ctxUserKey).(User)
+		if user.Role != RoleAdmin {
+			writeError(w, http.StatusForbidden, "Alleen het beheeraccount mag dit doen.")
 			return
 		}
 		next(w, r)
-	}
+	})
+}
+
+func bearerToken(r *http.Request) string {
+	return strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 }
 
 func (h *Hub) index(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +176,77 @@ func (h *Hub) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "Veyra Hub"})
 }
 
+// login exchanges a username/password for a fresh access/refresh token pair,
+// scoped to a device. This replaces the old static-token login for both the
+// admin account and viewer accounts.
+func (h *Hub) login(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		DeviceID   string `json:"deviceId"`
+		DeviceName string `json:"deviceName"`
+	}
+	if decodeJSON(r, &input) != nil {
+		writeError(w, http.StatusBadRequest, "Ongeldige aanvraag.")
+		return
+	}
+	user, ok := h.store.Authenticate(strings.TrimSpace(input.Username), input.Password)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "Gebruikersnaam of wachtwoord onjuist.")
+		return
+	}
+	writeSessionResponse(w, h.store, user, input.DeviceID, input.DeviceName)
+}
+
+// refreshToken rotates a session's access/refresh tokens without asking for
+// the password again, so a device can stay signed in.
+func (h *Hub) refreshToken(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		RefreshToken string `json:"refreshToken"`
+	}
+	if decodeJSON(r, &input) != nil || input.RefreshToken == "" {
+		writeError(w, http.StatusBadRequest, "Geef refreshToken op.")
+		return
+	}
+	_, user, accessToken, refreshToken, err := h.store.RefreshSession(input.RefreshToken)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "De sessie is verlopen of ingetrokken. Log opnieuw in.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accessToken": accessToken, "refreshToken": refreshToken,
+		"user": publicUser(user),
+	})
+}
+
+func (h *Hub) logout(w http.ResponseWriter, r *http.Request) {
+	session, _ := r.Context().Value(ctxSessionKey).(Session)
+	if err := h.store.RevokeSession(session.ID); err != nil && !errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusInternalServerError, "Uitloggen is mislukt.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeSessionResponse issues a new session for user/device and writes the
+// standard login/refresh response shape.
+func writeSessionResponse(w http.ResponseWriter, store *Store, user User, deviceID, deviceName string) {
+	session, accessToken, refreshToken, err := store.CreateSession(user.ID, deviceID, deviceName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Aanmelden is mislukt.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accessToken": accessToken, "refreshToken": refreshToken,
+		"accessExpiresAt": session.AccessExpiresAt, "refreshExpiresAt": session.RefreshExpiresAt,
+		"user": publicUser(user),
+	})
+}
+
+func publicUser(user User) map[string]any {
+	return map[string]any{"id": user.ID, "username": user.Username, "role": user.Role, "enabled": user.Enabled}
+}
+
 func (h *Hub) status(w http.ResponseWriter, r *http.Request) {
 	state := h.store.Snapshot()
 	enabled := 0
@@ -120,27 +255,59 @@ func (h *Hub) status(w http.ResponseWriter, r *http.Request) {
 			enabled++
 		}
 	}
+	viewers := 0
+	for _, user := range state.Users {
+		if user.Role == RoleViewer {
+			viewers++
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "Veyra Hub", "version": version, "nodeID": state.NodeID,
 		"addonCount": len(state.Addons), "enabledAddonCount": enabled,
-		"viewerCount": len(state.Viewers), "username": h.username, "jellyfinCompatible": true,
+		"viewerCount": viewers, "username": h.username, "jellyfinCompatible": true,
 	})
 }
 
-func (h *Hub) listUsers(w http.ResponseWriter, r *http.Request) {
-	viewers := h.store.Snapshot().Viewers
-	users := make([]map[string]any, 0, len(viewers))
-	for _, viewer := range viewers {
-		users = append(users, map[string]any{
-			"id": viewer.ID, "username": viewer.Username, "enabled": viewer.Enabled, "createdAt": viewer.CreatedAt,
+func (h *Hub) listSessions(w http.ResponseWriter, r *http.Request) {
+	sessions := h.store.AllSessions()
+	values := make([]map[string]any, 0, len(sessions))
+	for _, session := range sessions {
+		user, _ := h.store.UserByID(session.UserID)
+		values = append(values, map[string]any{
+			"id": session.ID, "userID": session.UserID, "username": user.Username,
+			"deviceID": session.DeviceID, "deviceName": session.DeviceName,
+			"createdAt": session.CreatedAt, "accessExpiresAt": session.AccessExpiresAt,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"users": users})
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": values})
+}
+
+func (h *Hub) revokeSession(w http.ResponseWriter, r *http.Request) {
+	if err := h.store.RevokeSession(r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, "Sessie niet gevonden.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Hub) listUsers(w http.ResponseWriter, r *http.Request) {
+	users := h.store.Snapshot().Users
+	values := make([]map[string]any, 0, len(users))
+	for _, user := range users {
+		if user.Role == RoleAdmin {
+			continue
+		}
+		values = append(values, map[string]any{
+			"id": user.ID, "username": user.Username, "enabled": user.Enabled, "createdAt": user.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": values})
 }
 
 func (h *Hub) addUser(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Username string `json:"username"`
+		Password string `json:"password"`
 	}
 	if decodeJSON(r, &input) != nil {
 		writeError(w, http.StatusBadRequest, "Ongeldige aanvraag.")
@@ -151,11 +318,11 @@ func (h *Hub) addUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Gebruik een gebruikersnaam van 3 tot 64 tekens.")
 		return
 	}
-	if strings.EqualFold(username, h.username) {
-		writeError(w, http.StatusConflict, "Deze gebruikersnaam is gereserveerd voor beheer.")
+	if len(input.Password) < minPasswordLength {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Gebruik een wachtwoord van minstens %d tekens.", minPasswordLength))
 		return
 	}
-	viewer, token, err := h.store.AddViewer(username)
+	user, err := h.store.CreateUser(username, input.Password, RoleViewer)
 	if errors.Is(err, os.ErrExist) {
 		writeError(w, http.StatusConflict, "Deze gebruikersnaam bestaat al.")
 		return
@@ -165,27 +332,44 @@ func (h *Hub) addUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"id": viewer.ID, "username": viewer.Username, "enabled": viewer.Enabled, "createdAt": viewer.CreatedAt, "token": token,
+		"id": user.ID, "username": user.Username, "enabled": user.Enabled, "createdAt": user.CreatedAt,
 	})
 }
 
 func (h *Hub) patchUser(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Enabled *bool `json:"enabled"`
+		Enabled  *bool   `json:"enabled"`
+		Password *string `json:"password"`
 	}
-	if decodeJSON(r, &input) != nil || input.Enabled == nil {
-		writeError(w, http.StatusBadRequest, "Geef enabled op.")
+	if decodeJSON(r, &input) != nil || (input.Enabled == nil && input.Password == nil) {
+		writeError(w, http.StatusBadRequest, "Geef enabled en/of password op.")
 		return
 	}
-	if err := h.store.SetViewerEnabled(r.PathValue("id"), *input.Enabled); err != nil {
-		writeError(w, http.StatusNotFound, "Gebruiker niet gevonden.")
-		return
+	id := r.PathValue("id")
+	if input.Enabled != nil {
+		if err := h.store.SetUserEnabled(id, *input.Enabled); err != nil {
+			writeError(w, http.StatusNotFound, "Gebruiker niet gevonden.")
+			return
+		}
+	}
+	if input.Password != nil {
+		if len(*input.Password) < minPasswordLength {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("Gebruik een wachtwoord van minstens %d tekens.", minPasswordLength))
+			return
+		}
+		if err := h.store.SetUserPassword(id, *input.Password); err != nil {
+			writeError(w, http.StatusNotFound, "Gebruiker niet gevonden.")
+			return
+		}
+		// A password reset signs every device for this account out, so the
+		// old password can no longer be used to keep a session alive.
+		_ = h.store.RevokeUserSessions(id)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Hub) deleteUser(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.DeleteViewer(r.PathValue("id")); err != nil {
+	if err := h.store.DeleteUser(r.PathValue("id")); err != nil {
 		writeError(w, http.StatusNotFound, "Gebruiker niet gevonden.")
 		return
 	}
@@ -255,11 +439,19 @@ func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
 		}
 		catalogs = append(catalogs, AddonCatalog{ID: value.ID, Type: value.Type, Name: name, Extra: extra})
 	}
+	baseURL := strings.TrimSuffix(base.String(), "/")
+	configureURL := ""
+	// Stremio-style addons signal a configuration page with behaviorHints;
+	// by convention it lives at "<base>/configure". The hub never builds
+	// its own settings form for this — Configure always opens the addon.
+	if manifest.BehaviorHints.Configurable || manifest.BehaviorHints.ConfigurationRequired {
+		configureURL = baseURL + "/configure"
+	}
 	addon := Addon{
 		ID: manifest.ID, Name: manifest.Name, Description: strings.TrimSpace(manifest.Description),
 		Version: strings.TrimSpace(manifest.Version), ManifestURL: manifestURL.String(),
-		BaseURL: strings.TrimSuffix(base.String(), "/"), Resources: resources, Catalogs: catalogs,
-		Enabled: true, AddedAt: time.Now().UTC(),
+		BaseURL: baseURL, ConfigureURL: configureURL, Resources: resources, Catalogs: catalogs,
+		Enabled: true, AddedAt: time.Now().UTC(), Reachable: true,
 	}
 	if err := h.store.PutAddon(addon); err != nil {
 		writeError(w, http.StatusInternalServerError, "De addon kon niet worden opgeslagen.")
@@ -322,7 +514,11 @@ func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubS
 	state := h.store.Snapshot()
 	var enabled []Addon
 	for _, addon := range state.Addons {
-		if addon.Enabled {
+		// Only ask addons that actually declared the "stream" capability.
+		// Calling every enabled addon regardless of what it supports wastes
+		// requests and pollutes health/status with failures from addons
+		// that were never going to answer (e.g. a metadata-only addon).
+		if addon.Enabled && contains(addon.Resources, "stream") {
 			enabled = append(enabled, addon)
 		}
 	}
@@ -338,6 +534,11 @@ func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubS
 		go func(addon Addon) {
 			defer wg.Done()
 			values, err := h.fetchStreams(ctx, addon, mediaType, id)
+			if err != nil {
+				h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+			} else {
+				h.store.RecordAddonHealth(addon.ID, true, "")
+			}
 			results <- result{values, err}
 		}(addon)
 	}
@@ -405,6 +606,114 @@ func (h *Hub) fetchStreams(ctx context.Context, addon Addon, mediaType, id strin
 	return values, nil
 }
 
+func (h *Hub) subtitles(w http.ResponseWriter, r *http.Request) {
+	mediaType := r.PathValue("type")
+	id := r.PathValue("id")
+	if (mediaType != "movie" && mediaType != "series") || id == "" {
+		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
+		return
+	}
+
+	values := h.aggregateSubtitles(r.Context(), mediaType, id)
+	writeJSON(w, http.StatusOK, map[string]any{"subtitles": values})
+}
+
+// aggregateSubtitles is the subtitle equivalent of aggregateStreams: it asks
+// every enabled addon that declared the "subtitle" capability, in parallel,
+// and combines the results. Kept as its own capability (rather than folded
+// into streams) so any number of subtitle addons can serve a title
+// independently of which addon resolved the video itself.
+func (h *Hub) aggregateSubtitles(ctx context.Context, mediaType, id string) []HubSubtitle {
+	state := h.store.Snapshot()
+	var enabled []Addon
+	for _, addon := range state.Addons {
+		if addon.Enabled && contains(addon.Resources, "subtitles") {
+			enabled = append(enabled, addon)
+		}
+	}
+
+	type result struct {
+		subtitles []HubSubtitle
+		err       error
+	}
+	results := make(chan result, len(enabled))
+	var wg sync.WaitGroup
+	for _, addon := range enabled {
+		wg.Add(1)
+		go func(addon Addon) {
+			defer wg.Done()
+			values, err := h.fetchSubtitles(ctx, addon, mediaType, id)
+			if err != nil {
+				h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+			} else {
+				h.store.RecordAddonHealth(addon.ID, true, "")
+			}
+			results <- result{values, err}
+		}(addon)
+	}
+	go func() { wg.Wait(); close(results) }()
+
+	var values []HubSubtitle
+	for result := range results {
+		if result.err != nil {
+			slog.Warn("addon subtitle request failed", "error", result.err)
+			continue
+		}
+		values = append(values, result.subtitles...)
+	}
+	seen := map[string]bool{}
+	deduplicated := make([]HubSubtitle, 0, len(values))
+	for _, value := range values {
+		if seen[value.URL] {
+			continue
+		}
+		seen[value.URL] = true
+		deduplicated = append(deduplicated, value)
+	}
+	return deduplicated
+}
+
+// fetchSubtitles calls a subtitle addon's Stremio-style
+// "subtitles/{type}/{id}.json" endpoint.
+func (h *Hub) fetchSubtitles(ctx context.Context, addon Addon, mediaType, id string) ([]HubSubtitle, error) {
+	base, err := url.Parse(addon.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	base.Path = path.Join(base.Path, "subtitles", mediaType, id+".json")
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	request.Header.Set("Accept", "application/json")
+	response, err := h.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return nil, fmt.Errorf("%s returned HTTP %d", addon.Name, response.StatusCode)
+	}
+	var payload subtitleResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	values := make([]HubSubtitle, 0, len(payload.Subtitles))
+	for _, raw := range payload.Subtitles {
+		var source struct {
+			ID, Lang, URL string
+		}
+		if json.Unmarshal(raw, &source) != nil {
+			continue
+		}
+		subtitleURL, err := url.Parse(strings.TrimSpace(source.URL))
+		if err != nil || (subtitleURL.Scheme != "http" && subtitleURL.Scheme != "https") || subtitleURL.Host == "" {
+			continue
+		}
+		values = append(values, HubSubtitle{
+			AddonID: addon.ID, AddonName: addon.Name, Lang: source.Lang, Name: source.ID, URL: subtitleURL.String(),
+		})
+	}
+	return values, nil
+}
+
 func validateEndpoint(value string) (*url.URL, error) {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
@@ -428,15 +737,6 @@ func isPrivateHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && (ip.IsPrivate() || ip.IsLoopback())
-}
-
-func supportsStreams(raw json.RawMessage) bool {
-	for _, name := range resourceNames(raw) {
-		if name == "stream" {
-			return true
-		}
-	}
-	return false
 }
 
 func resourceNames(raw json.RawMessage) []string {
@@ -463,6 +763,36 @@ func resourceNames(raw json.RawMessage) []string {
 		}
 	}
 	return result
+}
+
+// sanitizeAddonError turns a raw error from calling an addon into a short,
+// safe message for storage/display. Go's http client embeds the full
+// request URL (which can carry an API key in its query string) in errors
+// like "Get \"https://addon/x?token=…\": dial tcp: …", so this never passes
+// err.Error() straight through — only a fixed set of generic categories.
+func sanitizeAddonError(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "time-out"
+	case errors.Is(err, context.Canceled):
+		return "verzoek geannuleerd"
+	}
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "returned HTTP"):
+		// Constructed by us (e.g. "<addon name> returned HTTP 502") and
+		// never contains the request URL, so it's safe as-is.
+		return message
+	case strings.Contains(message, "no such host") || strings.Contains(message, "dial tcp") || strings.Contains(message, "connection refused"):
+		return "kon addon niet bereiken"
+	case strings.Contains(message, "invalid character") || strings.Contains(message, "unexpected end of JSON") || strings.Contains(message, "cannot unmarshal"):
+		return "ongeldig antwoord van addon"
+	default:
+		return "aanvraag naar addon mislukt"
+	}
 }
 
 func deduplicateStreams(values []HubStream) []HubStream {
