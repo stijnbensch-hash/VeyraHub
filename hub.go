@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -77,6 +78,10 @@ func (h *Hub) Routes() http.Handler {
 	mux.HandleFunc("PATCH /v1/addons/{id}", h.auth(h.patchAddon))
 	mux.HandleFunc("POST /v1/addons/{id}/move", h.auth(h.moveAddon))
 	mux.HandleFunc("DELETE /v1/addons/{id}", h.auth(h.deleteAddon))
+	mux.HandleFunc("GET /v1/users", h.auth(h.listUsers))
+	mux.HandleFunc("POST /v1/users", h.auth(h.addUser))
+	mux.HandleFunc("PATCH /v1/users/{id}", h.auth(h.patchUser))
+	mux.HandleFunc("DELETE /v1/users/{id}", h.auth(h.deleteUser))
 	mux.HandleFunc("GET /v1/streams/{type}/{id}", h.auth(h.streams))
 	h.registerJellyfinRoutes(mux)
 	return securityHeaders(mux)
@@ -118,8 +123,73 @@ func (h *Hub) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "Veyra Hub", "version": version, "nodeID": state.NodeID,
 		"addonCount": len(state.Addons), "enabledAddonCount": enabled,
-		"username": h.username, "jellyfinCompatible": true,
+		"viewerCount": len(state.Viewers), "username": h.username, "jellyfinCompatible": true,
 	})
+}
+
+func (h *Hub) listUsers(w http.ResponseWriter, r *http.Request) {
+	viewers := h.store.Snapshot().Viewers
+	users := make([]map[string]any, 0, len(viewers))
+	for _, viewer := range viewers {
+		users = append(users, map[string]any{
+			"id": viewer.ID, "username": viewer.Username, "enabled": viewer.Enabled, "createdAt": viewer.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": users})
+}
+
+func (h *Hub) addUser(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Username string `json:"username"`
+	}
+	if decodeJSON(r, &input) != nil {
+		writeError(w, http.StatusBadRequest, "Ongeldige aanvraag.")
+		return
+	}
+	username := strings.TrimSpace(input.Username)
+	if len(username) < 3 || len(username) > 64 || strings.ContainsAny(username, "\r\n\t") {
+		writeError(w, http.StatusBadRequest, "Gebruik een gebruikersnaam van 3 tot 64 tekens.")
+		return
+	}
+	if strings.EqualFold(username, h.username) {
+		writeError(w, http.StatusConflict, "Deze gebruikersnaam is gereserveerd voor beheer.")
+		return
+	}
+	viewer, token, err := h.store.AddViewer(username)
+	if errors.Is(err, os.ErrExist) {
+		writeError(w, http.StatusConflict, "Deze gebruikersnaam bestaat al.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "De gebruiker kon niet worden opgeslagen.")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id": viewer.ID, "username": viewer.Username, "enabled": viewer.Enabled, "createdAt": viewer.CreatedAt, "token": token,
+	})
+}
+
+func (h *Hub) patchUser(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if decodeJSON(r, &input) != nil || input.Enabled == nil {
+		writeError(w, http.StatusBadRequest, "Geef enabled op.")
+		return
+	}
+	if err := h.store.SetViewerEnabled(r.PathValue("id"), *input.Enabled); err != nil {
+		writeError(w, http.StatusNotFound, "Gebruiker niet gevonden.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Hub) deleteUser(w http.ResponseWriter, r *http.Request) {
+	if err := h.store.DeleteViewer(r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, "Gebruiker niet gevonden.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Hub) listAddons(w http.ResponseWriter, r *http.Request) {
@@ -428,6 +498,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'")
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)

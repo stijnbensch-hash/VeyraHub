@@ -25,12 +25,14 @@ buildtargets en gegevensopslag van de Veyra-client.
 
 ## Beveiligingsgrenzen
 
-- alle beheer- en mediaserverroutes vereisen hetzelfde lokaal ingestelde token;
+- beheerroutes vereisen het afzonderlijk ingestelde beheerderstoken;
+- mediaserverroutes accepteren persoonlijke, intrekbare kijkaccounts;
+- toegangssleutels van kijkaccounts worden alleen als SHA-256-hash opgeslagen;
 - de publieke statusroute bevat geen addonconfiguratie;
 - configuratiebestanden worden met alleen gebruikersrechten geschreven;
 - publieke addon-URL's moeten HTTPS gebruiken; HTTP is alleen voor privéhosts;
 - credentials in addon-URL's zijn niet toegestaan;
 - manifest- en addonresponsen hebben vaste maximale groottes en time-outs.
 
-Een reverse proxy of privé-overlaynetwerk blijft vereist voor veilig gebruik
-buiten het lokale netwerk.
+Een TLS-afbrekende reverse proxy of vergelijkbare HTTPS-ingang blijft vereist
+voor veilig gebruik buiten het lokale netwerk.

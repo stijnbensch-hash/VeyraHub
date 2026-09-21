@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -147,4 +148,71 @@ func TestAuthenticationRequired(t *testing.T) {
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", response.Code)
 	}
+}
+
+func TestViewerAccountCanUseJellyfinButNotAdminAPI(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "hub.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(NewHub(store, "admin", "admin-secret", nil).Routes())
+	defer server.Close()
+
+	createBody, _ := json.Marshal(map[string]string{"username": "vriend"})
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/users", bytes.NewReader(createBody))
+	request.Header.Set("Authorization", "Bearer admin-secret")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusCreated {
+		t.Fatalf("create viewer failed: %v status=%v", err, response.StatusCode)
+	}
+	var created struct {
+		ID       string `json:"id"`
+		Username string `json:"username"`
+		Token    string `json:"token"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if created.ID == "" || len(created.Token) != 64 {
+		t.Fatalf("unexpected credentials: id=%q token length=%d", created.ID, len(created.Token))
+	}
+
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/v1/users", nil)
+	request.Header.Set("Authorization", "Bearer admin-secret")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if bytes.Contains(listBody, []byte(created.Token)) || bytes.Contains(listBody, []byte("tokenHash")) {
+		t.Fatal("viewer list exposed credential material")
+	}
+
+	authBody, _ := json.Marshal(map[string]string{"Username": created.Username, "Pw": created.Token})
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/Users/AuthenticateByName", bytes.NewReader(authBody))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("viewer Jellyfin auth failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/Users/"+created.ID+"/Views", nil)
+	request.Header.Set("X-Emby-Token", created.Token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("viewer Jellyfin request failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/v1/status", nil)
+	request.Header.Set("Authorization", "Bearer "+created.Token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("viewer reached admin API: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
 }

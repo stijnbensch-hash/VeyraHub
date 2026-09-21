@@ -25,12 +25,23 @@ publieke addonlijst. Gebruik alleen bronnen en media waarvoor je toestemming heb
 
 3. Start met `docker compose up -d --build`.
 4. Open `http://server-ip:8787`, vul het token in en voeg addonmanifesten toe.
-5. Voeg `http://server-ip:8787` in Veyra toe als Jellyfin-server met dezelfde
-   gebruikersnaam en hetzelfde token als wachtwoord.
+5. Maak in de beheerpagina een persoonlijk kijkaccount. Voeg de server in Veyra
+   toe als Jellyfin-server met die gebruikersnaam en de eenmalig getoonde
+   toegangssleutel als wachtwoord.
 
 Gebruik buiten het eigen netwerk HTTPS via een reverse proxy of privénetwerk.
-De hub bewaart alleen de addonconfiguratie. De inloggegevens komen uit de lokale
-omgeving, worden niet in `hub.json` geschreven en worden niet gelogd.
+Het beheeraccount komt uit de lokale omgeving en wordt niet in `hub.json`
+geschreven. Toegangssleutels van kijkaccounts worden alleen bij het aanmaken
+getoond; daarna bewaart de hub uitsluitend SHA-256-hashes. Sleutels worden niet
+gelogd.
+
+## Accounts
+
+- Het beheeraccount mag addons en kijkaccounts beheren en hoort privé te blijven.
+- Elk kijkaccount heeft een eigen gebruikersnaam en willekeurige toegangssleutel.
+- Kijkaccounts kunnen alleen de Jellyfin-compatibele mediaserver gebruiken.
+- Een account kan direct worden gepauzeerd of verwijderd zonder andere personen
+  opnieuw te laten aanmelden.
 
 ## Mediaservercompatibiliteit
 
@@ -53,6 +64,8 @@ maar zijn in deze versie niet allemaal gegarandeerd.
 - `GET /v1/status` — hubidentiteit en aantallen.
 - `GET|POST /v1/addons` — addons bekijken/toevoegen.
 - `PATCH|DELETE /v1/addons/{id}` — activeren, pauzeren of verwijderen.
+- `GET|POST /v1/users` — persoonlijke kijkaccounts bekijken/toevoegen.
+- `PATCH|DELETE /v1/users/{id}` — een kijkaccount pauzeren of verwijderen.
 - `GET /v1/streams/{movie|series}/{imdb-id}` — directe streams samenvoegen.
 
 Alle `/v1`-routes vereisen `Authorization: Bearer <token>`.
@@ -68,7 +81,7 @@ go run . -token een-lokaal-testtoken
 
 ## Grenzen van deze versie
 
-- Er is nog geen multi-userbeheer, voortgangssynchronisatie of transcoding.
+- Er is nog geen voortgangssynchronisatie of transcoding.
 - Alleen directe `http`- en `https`-streams worden doorgegeven.
 - De eerste directe bron die de addons opleveren wordt gebruikt voor de
   mediaserverstream; interactieve bronkeuze volgt later.

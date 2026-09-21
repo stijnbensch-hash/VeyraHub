@@ -76,20 +76,38 @@ func (h *Hub) jellyfinAuthenticate(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"Username"`
 		Password string `json:"Pw"`
 	}
-	if decodeJSON(r, &input) != nil || !secureEqual(input.Username, h.username) || !secureEqual(input.Password, h.token) {
+	if decodeJSON(r, &input) != nil {
 		writeError(w, http.StatusUnauthorized, "Gebruikersnaam of wachtwoord onjuist.")
 		return
 	}
 	state := h.store.Snapshot()
+	userID := ""
+	username := ""
+	if secureEqual(input.Username, h.username) && secureEqual(input.Password, h.token) {
+		userID = state.NodeID
+		username = h.username
+	} else if viewer, ok := h.store.AuthenticateViewer(input.Username, input.Password); ok {
+		userID = viewer.ID
+		username = viewer.Username
+	} else {
+		writeError(w, http.StatusUnauthorized, "Gebruikersnaam of wachtwoord onjuist.")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"User":        map[string]any{"Id": state.NodeID, "Name": h.username},
-		"AccessToken": h.token, "ServerId": state.NodeID,
+		"User":        map[string]any{"Id": userID, "Name": username},
+		"AccessToken": input.Password, "ServerId": state.NodeID,
 	})
 }
 
 func (h *Hub) jellyfinProtected(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !secureEqual(jellyfinToken(r), h.token) {
+		token := jellyfinToken(r)
+		if secureEqual(token, h.token) {
+			next(w, r)
+			return
+		}
+		viewer, ok := h.store.ViewerForToken(token)
+		if !ok || (r.PathValue("userID") != "" && r.PathValue("userID") != viewer.ID) {
 			writeError(w, http.StatusUnauthorized, "Een geldige mediaserversessie is vereist.")
 			return
 		}
