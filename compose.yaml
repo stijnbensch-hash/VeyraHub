@@ -1,0 +1,14 @@
+services:
+  veyra-hub:
+    build: .
+    restart: unless-stopped
+    environment:
+      VEYRA_HUB_USERNAME: "${VEYRA_HUB_USERNAME:-admin}"
+      VEYRA_HUB_TOKEN: "${VEYRA_HUB_TOKEN:?set VEYRA_HUB_TOKEN in .env}"
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
