@@ -64,7 +64,7 @@ func (h *Hub) jellyfinAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fields := embyAuthFields(r.Header.Get("X-Emby-Authorization"))
-	session, accessToken, _, err := h.store.CreateSession(user.ID, fields["DeviceId"], fields["Device"])
+	_, accessToken, err := h.store.CreateMediaSession(user.ID, fields["DeviceId"], fields["Device"])
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Aanmelden is mislukt.")
 		return
@@ -74,7 +74,6 @@ func (h *Hub) jellyfinAuthenticate(w http.ResponseWriter, r *http.Request) {
 		"User":        map[string]any{"Id": user.ID, "Name": user.Username},
 		"AccessToken": accessToken, "ServerId": state.NodeID,
 	})
-	_ = session
 }
 
 func (h *Hub) jellyfinProtected(next http.HandlerFunc) http.HandlerFunc {

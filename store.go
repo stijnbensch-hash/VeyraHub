@@ -276,6 +276,17 @@ func (s *Store) Authenticate(username, password string) (User, bool) {
 // CreateSession issues a fresh access/refresh token pair for a device and
 // persists only their hashes.
 func (s *Store) CreateSession(userID, deviceID, deviceName string) (Session, string, string, error) {
+	return s.createSession(userID, deviceID, deviceName, false)
+}
+
+// Jellyfin clients keep only AccessToken, so they cannot rotate a refresh token.
+// Keep that access token valid until the session is revoked or user disabled.
+func (s *Store) CreateMediaSession(userID, deviceID, deviceName string) (Session, string, error) {
+	session, accessToken, _, err := s.createSession(userID, deviceID, deviceName, true)
+	return session, accessToken, err
+}
+
+func (s *Store) createSession(userID, deviceID, deviceName string, media bool) (Session, string, string, error) {
 	if deviceID == "" {
 		deviceID = randomID()
 	}
@@ -286,6 +297,10 @@ func (s *Store) CreateSession(userID, deviceID, deviceName string) (Session, str
 		ID: randomID(), UserID: userID, DeviceID: deviceID, DeviceName: deviceName,
 		AccessTokenHash: tokenHash(accessToken), RefreshTokenHash: tokenHash(refreshToken),
 		CreatedAt: now, AccessExpiresAt: now.Add(accessTokenTTL), RefreshExpiresAt: now.Add(refreshTokenTTL),
+	}
+	if media {
+		session.AccessExpiresAt = time.Time{}
+		session.RefreshExpiresAt = time.Time{}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -311,7 +326,7 @@ func (s *Store) SessionByAccessToken(token string) (Session, User, bool) {
 		if !secureHashEqual(session.AccessTokenHash, wantedHash) {
 			continue
 		}
-		if session.RevokedAt != nil || now.After(session.AccessExpiresAt) {
+		if session.RevokedAt != nil || (!session.AccessExpiresAt.IsZero() && now.After(session.AccessExpiresAt)) {
 			return Session{}, User{}, false
 		}
 		user, ok := s.userByID(session.UserID)
