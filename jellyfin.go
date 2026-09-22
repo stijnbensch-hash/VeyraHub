@@ -34,6 +34,8 @@ func (h *Hub) registerJellyfinRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /Users/{userID}/Items/Latest", h.jellyfinProtected(h.jellyfinLatest))
 	mux.HandleFunc("GET /Items/{itemID}/Images/{kind}", h.jellyfinProtected(h.jellyfinImage))
 	mux.HandleFunc("GET /Items/{itemID}/Images/Backdrop/{index}", h.jellyfinProtected(h.jellyfinImage))
+	mux.HandleFunc("GET /Items/{itemID}/PlaybackInfo", h.jellyfinProtected(h.jellyfinPlaybackInfo))
+	mux.HandleFunc("POST /Items/{itemID}/PlaybackInfo", h.jellyfinProtected(h.jellyfinPlaybackInfo))
 	mux.HandleFunc("GET /Videos/{itemID}/stream", h.jellyfinProtected(h.jellyfinStream))
 }
 
@@ -212,6 +214,76 @@ func (h *Hub) jellyfinImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+}
+
+func (h *Hub) jellyfinPlaybackInfo(w http.ResponseWriter, r *http.Request) {
+	item, err := decodeHubID(r.PathValue("itemID"))
+	if err != nil || item.MediaID == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	streams := h.aggregateStreams(r.Context(), item.MediaType, item.MediaID)
+
+	mediaSources := make([]map[string]any, 0, len(streams))
+	for index, stream := range streams {
+		name := strings.TrimSpace(stream.Name)
+		if name == "" {
+			name = strings.TrimSpace(stream.Title)
+		}
+		if name == "" {
+			name = "Bron " + strconv.Itoa(index+1)
+		}
+
+		sourceID := encodeHubID(hubItemID{
+			Kind:      "stream",
+			AddonID:   stream.AddonID,
+			MediaType: item.MediaType,
+			MediaID:   item.MediaID,
+			Name:      name,
+		})
+
+		source := map[string]any{
+			"Id":                         sourceID,
+			"Name":                       name,
+			"Path":                       stream.URL,
+			"Protocol":                   "Http",
+			"Type":                       "Default",
+			"Container":                  "",
+			"IsRemote":                   true,
+			"SupportsDirectPlay":         true,
+			"SupportsDirectStream":       true,
+			"SupportsTranscoding":        false,
+			"SupportsProbing":            false,
+			"RequiredHttpHeaders":        map[string]string{},
+			"MediaStreams":               []any{},
+			"MediaAttachments":           []any{},
+			"Formats":                    []string{},
+			"Bitrate":                    0,
+			"DefaultAudioStreamIndex":    nil,
+			"DefaultSubtitleStreamIndex": nil,
+		}
+
+		if stream.Filename != "" {
+			source["Path"] = stream.URL
+		}
+
+		if stream.VideoSize > 0 {
+			source["Size"] = stream.VideoSize
+		}
+
+		if stream.Description != "" {
+			source["Name"] = name
+		}
+
+		mediaSources = append(mediaSources, source)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"MediaSources":  mediaSources,
+		"PlaySessionId": "",
+		"ErrorCode":     nil,
+	})
 }
 
 func (h *Hub) jellyfinStream(w http.ResponseWriter, r *http.Request) {
