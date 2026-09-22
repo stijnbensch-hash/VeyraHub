@@ -49,6 +49,17 @@ func adminLogin(t *testing.T, serverURL, password string) string {
 	return payload.AccessToken
 }
 
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+
+	store, err := NewStore(filepath.Join(t.TempDir(), "hub.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return store
+}
+
 func TestAddonAndStreamAggregation(t *testing.T) {
 	addon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -531,4 +542,149 @@ func TestViewerAccountCanUseJellyfinButNotAdminAPI(t *testing.T) {
 		t.Fatalf("viewer reached admin API: %v status=%v", err, response.StatusCode)
 	}
 	response.Body.Close()
+}
+
+func TestNativeAPIRequiresSession(t *testing.T) {
+	store := newTestStore(t)
+	hub := NewHub(store, "admin", "secret-password", nil)
+
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+
+	request, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/catalogs", nil)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", response.StatusCode)
+	}
+}
+
+func TestViewerCanUseNativeAPIButCannotManageAddons(t *testing.T) {
+	store := newTestStore(t)
+	hub := NewHub(store, "admin", "admin-secret-password", nil)
+
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+
+	adminToken := adminLogin(t, server.URL, "admin-secret-password")
+
+	createBody, _ := json.Marshal(map[string]string{
+		"username": "viewer",
+		"password": "viewer-secret-password",
+	})
+
+	request, _ := http.NewRequest(
+		http.MethodPost,
+		server.URL+"/v1/users",
+		bytes.NewReader(createBody),
+	)
+	request.Header.Set("Authorization", "Bearer "+adminToken)
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusCreated {
+		defer response.Body.Close()
+		t.Fatalf("create viewer failed: %d", response.StatusCode)
+	}
+	response.Body.Close()
+
+	loginBody, _ := json.Marshal(map[string]string{
+		"username":   "viewer",
+		"password":   "viewer-secret-password",
+		"deviceId":   "test-device",
+		"deviceName": "Test Device",
+	})
+
+	request, _ = http.NewRequest(
+		http.MethodPost,
+		server.URL+"/v1/auth/login",
+		bytes.NewReader(loginBody),
+	)
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		t.Fatalf("viewer login failed: %d", response.StatusCode)
+	}
+
+	var login struct {
+		AccessToken string `json:"accessToken"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&login); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+
+	request, _ = http.NewRequest(
+		http.MethodGet,
+		server.URL+"/api/v1/catalogs",
+		nil,
+	)
+	request.Header.Set("Authorization", "Bearer "+login.AccessToken)
+
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		t.Fatalf("viewer native API expected 200, got %d", response.StatusCode)
+	}
+	response.Body.Close()
+
+	request, _ = http.NewRequest(
+		http.MethodGet,
+		server.URL+"/v1/addons",
+		nil,
+	)
+	request.Header.Set("Authorization", "Bearer "+login.AccessToken)
+
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("viewer addon management expected 403, got %d", response.StatusCode)
+	}
+}
+
+func TestNativeSearchRejectsEmptyQuery(t *testing.T) {
+	store := newTestStore(t)
+	hub := NewHub(store, "admin", "secret-password", nil)
+
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+
+	token := adminLogin(t, server.URL, "secret-password")
+
+	request, _ := http.NewRequest(
+		http.MethodGet,
+		server.URL+"/api/v1/search",
+		nil,
+	)
+	request.Header.Set("Authorization", "Bearer "+token)
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", response.StatusCode)
+	}
 }
