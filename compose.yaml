@@ -2,11 +2,11 @@ services:
   veyra-hub:
     build: .
     restart: unless-stopped
+    network_mode: host
     environment:
       VEYRA_HUB_USERNAME: "${VEYRA_HUB_USERNAME:-admin}"
       VEYRA_HUB_TOKEN: "${VEYRA_HUB_TOKEN:?set VEYRA_HUB_TOKEN in .env}"
-    ports:
-      - "127.0.0.1:8787:8787"
+      VEYRA_HUB_ADDRESS: "127.0.0.1:8787"
     volumes:
       - ./data:/data
     read_only: true
