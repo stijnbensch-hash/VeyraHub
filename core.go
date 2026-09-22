@@ -145,12 +145,12 @@ func (h *Hub) mediaMetadata(
 		return MediaItem{}, errors.New("missing media id")
 	}
 
-	meta, err := h.fetchMeta(ctx, preferredAddonID, mediaType, id)
+	meta, sourceAddonID, err := h.fetchMetaWithSource(ctx, preferredAddonID, mediaType, id)
 	if err != nil {
 		return MediaItem{}, err
 	}
 
-	return mediaItemFromMeta(preferredAddonID, meta), nil
+	return mediaItemFromMeta(sourceAddonID, meta), nil
 }
 
 func (h *Hub) mediaSearch(ctx context.Context, query string) []MediaItem {

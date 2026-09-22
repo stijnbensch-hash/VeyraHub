@@ -294,33 +294,70 @@ func (h *Hub) fetchCatalog(ctx context.Context, addon Addon, catalog AddonCatalo
 }
 
 func (h *Hub) fetchMeta(ctx context.Context, preferredAddonID, mediaType, id string) (stremioMeta, error) {
+	meta, _, err := h.fetchMetaWithSource(ctx, preferredAddonID, mediaType, id)
+	return meta, err
+}
+
+func (h *Hub) fetchMetaWithSource(ctx context.Context, preferredAddonID, mediaType, id string) (stremioMeta, string, error) {
 	addons := h.store.Snapshot().Addons
+
 	for pass := 0; pass < 2; pass++ {
 		for _, addon := range addons {
 			if !addon.Enabled || !contains(addon.Resources, "meta") || (pass == 0) != (addon.ID == preferredAddonID) {
 				continue
 			}
+
 			base, err := url.Parse(addon.BaseURL)
 			if err != nil {
 				continue
 			}
+
 			base.Path = path.Join(base.Path, "meta", mediaType, id+".json")
-			request, _ := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
-			response, err := h.client.Do(request)
+
+			request, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
 			if err != nil {
 				continue
 			}
+
+			response, err := h.client.Do(request)
+			if err != nil {
+				h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				continue
+			}
+
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				response.Body.Close()
+				h.store.RecordAddonHealth(
+					addon.ID,
+					false,
+					fmt.Sprintf("metadata request returned HTTP %d", response.StatusCode),
+				)
+				continue
+			}
+
 			var payload struct {
 				Meta stremioMeta `json:"meta"`
 			}
+
 			err = json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&payload)
 			response.Body.Close()
-			if err == nil && payload.Meta.ID != "" {
-				return payload.Meta, nil
+
+			if err != nil {
+				h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				continue
 			}
+
+			if payload.Meta.ID == "" {
+				h.store.RecordAddonHealth(addon.ID, false, "metadata response contained no media item")
+				continue
+			}
+
+			h.store.RecordAddonHealth(addon.ID, true, "")
+			return payload.Meta, addon.ID, nil
 		}
 	}
-	return stremioMeta{}, fmt.Errorf("metadata not found")
+
+	return stremioMeta{}, "", fmt.Errorf("metadata not found")
 }
 
 func (h *Hub) searchCatalogs(ctx context.Context, query string) []map[string]any {
