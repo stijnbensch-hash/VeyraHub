@@ -125,6 +125,7 @@ func (h *Hub) Routes() http.Handler {
 	mux.HandleFunc("DELETE /v1/users/{id}", h.requireAdmin(h.deleteUser))
 	mux.HandleFunc("GET /v1/streams/{type}/{id}", h.requireAdmin(h.streams))
 	mux.HandleFunc("GET /v1/subtitles/{type}/{id}", h.requireAdmin(h.subtitles))
+	h.registerVeyraSyncRoutes(mux)
 	h.registerNativeRoutes(mux)
 	h.registerJellyfinRoutes(mux)
 	return securityHeaders(mux)

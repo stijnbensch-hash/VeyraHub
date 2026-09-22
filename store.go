@@ -98,10 +98,11 @@ func (s Session) active(now time.Time) bool {
 }
 
 type State struct {
-	NodeID   string    `json:"nodeID"`
-	Addons   []Addon   `json:"addons"`
-	Users    []User    `json:"users,omitempty"`
-	Sessions []Session `json:"sessions,omitempty"`
+	NodeID    string          `json:"nodeID"`
+	Addons    []Addon         `json:"addons"`
+	Users     []User          `json:"users,omitempty"`
+	Sessions  []Session       `json:"sessions,omitempty"`
+	VeyraSync []VeyraUserSync `json:"veyraSync,omitempty"`
 }
 
 type Store struct {
@@ -136,6 +137,7 @@ func (s *Store) Snapshot() State {
 	copyState.Addons = append([]Addon{}, s.state.Addons...)
 	copyState.Users = append([]User{}, s.state.Users...)
 	copyState.Sessions = append([]Session{}, s.state.Sessions...)
+	copyState.VeyraSync = append([]VeyraUserSync{}, s.state.VeyraSync...)
 	return copyState
 }
 
@@ -224,6 +226,15 @@ func (s *Store) DeleteUser(id string) error {
 		}
 	}
 	s.state.Sessions = kept
+
+	syncKept := s.state.VeyraSync[:0]
+	for _, syncState := range s.state.VeyraSync {
+		if syncState.UserID != id {
+			syncKept = append(syncKept, syncState)
+		}
+	}
+	s.state.VeyraSync = syncKept
+
 	return s.persistLocked()
 }
 
