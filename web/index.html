@@ -7,7 +7,7 @@
   </style>
 </head>
 <body><main class="shell">
-  <header class="hero"><div class="rail" aria-hidden="true"></div><div><div class="eyebrow">Zelf gehost · eigen bronnen</div><h1>Veyra Hub</h1><p>Addons als één zelfstandige mediaserver.</p></div><div class="badge" id="headerStatus">Niet verbonden</div></header>
+  <header class="hero"><div class="rail" aria-hidden="true"></div><div><div class="eyebrow">Zelf gehost · eigen bronnen</div><h1>Veyra Hub</h1><p>Addons als één zelfstandige mediaserver.</p></div><div style="display:flex;gap:10px;align-items:center"><div class="badge" id="headerStatus">Niet verbonden</div><button class="secondary" id="logoutButton" hidden>Uitloggen</button></div></header>
   <section id="loginPanel"><h2 class="section-title">Beheer openen</h2><div class="gradient-card login"><p class="hint">Log in met het beheeraccount van deze hub.</p><div class="login-grid" style="grid-template-columns:1fr 1fr auto"><input class="field" id="adminUsername" autocomplete="username" placeholder="Gebruikersnaam"><input class="field" id="adminPassword" type="password" autocomplete="current-password" placeholder="Wachtwoord"><button class="primary" id="connectButton">Open hub</button></div><p class="message" id="loginMessage"></p></div></section>
   <div id="app" hidden>
     <section class="section"><h2 class="section-title">Overzicht</h2><div class="stats"><div class="gradient-card stat"><div class="value" id="activeCount">0</div><div class="label">actieve addons</div></div><div class="gradient-card stat"><div class="value" id="catalogCount">0</div><div class="label">catalogusplanken</div></div><div class="gradient-card stat"><div class="value" id="viewerCount">0</div><div class="label">kijkaccounts</div></div><div class="gradient-card stat"><div class="value">Jellyfin</div><div class="label">compatibele verbinding</div></div></div></section>
@@ -19,7 +19,7 @@
 </main><script>
 let accessToken='';let statusData=null;const $=id=>document.getElementById(id);const headers=()=>({'Authorization':'Bearer '+accessToken,'Content-Type':'application/json'});
 async function api(path,options={}){const response=await fetch(path,{...options,headers:{...headers(),...(options.headers||{})}});if(!response.ok){let body={};try{body=await response.json()}catch{}throw new Error(body.error||'Aanvraag mislukt ('+response.status+')')}return response.status===204?null:response.json()}
-async function connect(){$('loginMessage').textContent='';try{const login=await fetch('/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('adminUsername').value.trim(),password:$('adminPassword').value,deviceName:'Beheerpagina'})});if(!login.ok){let body={};try{body=await login.json()}catch{}throw new Error(body.error||'Aanmelden mislukt')}const session=await login.json();accessToken=session.accessToken;$('adminPassword').value='';statusData=await api('/v1/status');sessionStorage.setItem('veyraHubAccessToken',accessToken);$('headerStatus').textContent='Online';$('app').hidden=false;$('loginPanel').hidden=true;$('serverAddress').textContent=location.origin;$('serverUsername').textContent=statusData.username;await Promise.all([load(),loadUsers()])}catch(error){$('loginMessage').textContent=error.message}}
+async function connect(){$('loginMessage').textContent='';try{const login=await fetch('/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('adminUsername').value.trim(),password:$('adminPassword').value,deviceName:'Beheerpagina'})});if(!login.ok){let body={};try{body=await login.json()}catch{}throw new Error(body.error||'Aanmelden mislukt')}const session=await login.json();accessToken=session.accessToken;localStorage.setItem('veyraHubRefreshToken',session.refreshToken);$('adminPassword').value='';statusData=await api('/v1/status');$('headerStatus').textContent='Online';$('app').hidden=false;$('loginPanel').hidden=true;$('logoutButton').hidden=false;$('serverAddress').textContent=location.origin;$('serverUsername').textContent=statusData.username;await Promise.all([load(),loadUsers()])}catch(error){$('loginMessage').textContent=error.message}}
 async function load(){const data=await api('/v1/addons');const addons=data.addons??[];$('activeCount').textContent=addons.filter(x=>x.enabled).length;$('catalogCount').textContent=addons.reduce((sum,x)=>sum+(x.catalogs?.length??0),0);if(!addons.length){const empty=document.createElement('div');empty.className='gradient-card empty';empty.textContent='Nog geen addons. Voeg hierboven een manifest toe.';$('addons').replaceChildren(empty);return}$('addons').replaceChildren(...addons.map((addon,index)=>{const el=document.createElement('article');el.className='gradient-card source';el.innerHTML='<div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 3v4a1 1 0 0 1-1 1H3v8h4a1 1 0 0 1 1 1v4h8v-4a1 1 0 0 1 1-1h4V8h-4a1 1 0 0 1-1-1V3Z"/><path d="M8 8h8v8H8Z"/></svg></div>';const info=document.createElement('div');const title=document.createElement('h3');title.textContent=addon.name;const desc=document.createElement('p');desc.textContent=addon.description||'Gekoppelde addonbron';const state=document.createElement('div');state.className='status';state.textContent=addon.enabled?'Actief · '+(addon.catalogs?.length??0)+' planken':'Gepauzeerd';info.append(title,desc,state);const health=document.createElement('div');health.className='hint';health.textContent=addonHealthText(addon);info.append(health);const actions=document.createElement('div');actions.className='actions';const up=document.createElement('button');up.className='secondary';up.textContent='↑';up.title='Hoger in bronvolgorde';up.disabled=index===0;up.onclick=()=>moveAddon(addon.id,-1);const down=document.createElement('button');down.className='secondary';down.textContent='↓';down.title='Lager in bronvolgorde';down.disabled=index===addons.length-1;down.onclick=()=>moveAddon(addon.id,1);const toggle=document.createElement('button');toggle.className='secondary';toggle.textContent=addon.enabled?'Pauzeer':'Activeer';toggle.onclick=()=>toggleAddon(addon.id,!addon.enabled);const remove=document.createElement('button');remove.className='danger';remove.textContent='Verwijder';remove.onclick=()=>removeAddon(addon.id,addon.name);actions.append(up,down,toggle);if(addon.configureURL){const configure=document.createElement('button');configure.className='secondary';configure.textContent='Configureren';configure.onclick=()=>window.open(addon.configureURL,'_blank','noopener');actions.append(configure)}actions.append(remove);el.append(info,actions);return el}))}
 function addonHealthText(addon){if(addon.lastErrorAt&&(!addon.lastSuccessAt||addon.lastErrorAt>addon.lastSuccessAt))return'Niet bereikbaar · '+(addon.lastError||'onbekende fout');if(addon.lastSuccessAt)return'Bereikbaar · laatste succesvolle aanroep '+new Date(addon.lastSuccessAt).toLocaleString('nl-BE');return'Nog niet aangeroepen'}
 async function addAddon(){try{$('message').textContent='Manifest controleren…';await api('/v1/addons',{method:'POST',body:JSON.stringify({manifestURL:$('manifest').value.trim()})});$('manifest').value='';$('message').textContent='Addon toegevoegd.';await load()}catch(error){$('message').textContent=error.message}}
@@ -31,6 +31,48 @@ async function addUser(){const password=$('newPassword').value;if(password.lengt
 async function toggleUser(id,enabled){try{await api('/v1/users/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify({enabled})});await loadUsers()}catch(error){$('userMessage').textContent=error.message}}
 async function removeUser(id,name){if(!confirm('Account van '+name+' verwijderen?'))return;try{await api('/v1/users/'+encodeURIComponent(id),{method:'DELETE'});await loadUsers()}catch(error){$('userMessage').textContent=error.message}}
 async function copyCredentials(){const text='Server: '+location.origin+'\nGebruikersnaam: '+$('createdUsername').textContent+'\nWachtwoord: '+$('createdPassword').textContent;await navigator.clipboard.writeText(text);$('userMessage').textContent='Verbindingsgegevens gekopieerd.'}
-async function tryResume(){const stored=sessionStorage.getItem('veyraHubAccessToken');if(!stored)return;accessToken=stored;try{statusData=await api('/v1/status');$('headerStatus').textContent='Online';$('app').hidden=false;$('loginPanel').hidden=true;$('serverAddress').textContent=location.origin;$('serverUsername').textContent=statusData.username;await Promise.all([load(),loadUsers()])}catch{accessToken='';sessionStorage.removeItem('veyraHubAccessToken')}}
-$('connectButton').onclick=connect;$('addButton').onclick=addAddon;$('addUserButton').onclick=addUser;$('copyCredentialsButton').onclick=copyCredentials;$('adminPassword').addEventListener('keydown',event=>{if(event.key==='Enter')connect()});$('manifest').addEventListener('keydown',event=>{if(event.key==='Enter')addAddon()});$('newUsername').addEventListener('keydown',event=>{if(event.key==='Enter')addUser()});tryResume();
+async function logout(){
+try{
+if(accessToken){
+await fetch('/v1/auth/logout',{
+method:'POST',
+headers:{'Authorization':'Bearer '+accessToken}
+});
+}
+}catch{}
+accessToken='';
+localStorage.removeItem('veyraHubRefreshToken');
+$('app').hidden=true;
+$('loginPanel').hidden=false;
+$('logoutButton').hidden=true;
+$('headerStatus').textContent='Niet verbonden';
+$('loginMessage').textContent='Uitgelogd.';
+}
+
+async function tryResume(){
+const refreshToken=localStorage.getItem('veyraHubRefreshToken');
+if(!refreshToken)return;
+try{
+const response=await fetch('/v1/auth/refresh',{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({refreshToken})
+});
+if(!response.ok)throw new Error('refresh failed');
+const session=await response.json();
+accessToken=session.accessToken;
+localStorage.setItem('veyraHubRefreshToken',session.refreshToken);
+statusData=await api('/v1/status');
+$('headerStatus').textContent='Online';
+$('app').hidden=false;
+$('loginPanel').hidden=true;
+$('logoutButton').hidden=false;
+$('serverAddress').textContent=location.origin;
+$('serverUsername').textContent=statusData.username;
+await Promise.all([load(),loadUsers()]);
+}catch{
+accessToken='';
+localStorage.removeItem('veyraHubRefreshToken');
+}}
+$('connectButton').onclick=connect;$('logoutButton').onclick=logout;$('addButton').onclick=addAddon;$('addUserButton').onclick=addUser;$('copyCredentialsButton').onclick=copyCredentials;$('adminPassword').addEventListener('keydown',event=>{if(event.key==='Enter')connect()});$('manifest').addEventListener('keydown',event=>{if(event.key==='Enter')addAddon()});$('newUsername').addEventListener('keydown',event=>{if(event.key==='Enter')addUser()});tryResume();
 </script></body></html>
