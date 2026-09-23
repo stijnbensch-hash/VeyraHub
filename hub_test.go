@@ -888,3 +888,137 @@ func TestNativeSearchRejectsEmptyQuery(t *testing.T) {
 		t.Fatalf("expected 400, got %d", response.StatusCode)
 	}
 }
+
+// TestSportsCapabilityFlowsThroughGenericRoutes guards the "sports" media
+// type: it must be treated exactly like "movie"/"series" by every generic
+// resource-based route (native catalogs/items/streams/subtitles and the
+// Jellyfin bridge's library views), without any addon-facing special case.
+func TestSportsCapabilityFlowsThroughGenericRoutes(t *testing.T) {
+	addon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/manifest.json":
+			json.NewEncoder(w).Encode(map[string]any{
+				"id": "test.sports", "name": "Sportbron", "version": "1.0",
+				"resources": []string{"catalog", "meta", "stream"},
+				"catalogs":  []any{map[string]any{"id": "live", "type": "sports", "name": "Live sport"}},
+			})
+		case "/catalog/sports/live.json":
+			json.NewEncoder(w).Encode(map[string]any{"metas": []any{
+				map[string]any{"id": "sport1", "type": "sports", "name": "Wedstrijd"},
+			}})
+		case "/meta/sports/sport1.json":
+			json.NewEncoder(w).Encode(map[string]any{"meta": map[string]any{
+				"id": "sport1", "type": "sports", "name": "Wedstrijd",
+			}})
+		case "/stream/sports/sport1.json":
+			json.NewEncoder(w).Encode(map[string]any{"streams": []any{
+				map[string]any{"name": "HD", "url": "https://media.example/live.m3u8"},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer addon.Close()
+
+	store := newTestStore(t)
+	hub := NewHub(store, "admin", "secret-password", addon.Client())
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+
+	accessToken := adminLogin(t, server.URL, "secret-password")
+
+	body, _ := json.Marshal(map[string]string{"manifestURL": addon.URL + "/manifest.json"})
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/addons", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusCreated {
+		t.Fatalf("add addon failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+
+	// Native catalogs must surface the sports catalog.
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/api/v1/catalogs?type=sports", nil)
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("native catalogs failed: %v status=%v", err, response.StatusCode)
+	}
+	var catalogs struct {
+		Catalogs []MediaCatalog `json:"catalogs"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&catalogs); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(catalogs.Catalogs) != 1 || catalogs.Catalogs[0].Type != "sports" {
+		t.Fatalf("expected one sports catalog, got %#v", catalogs.Catalogs)
+	}
+
+	// Native item lookup must accept the sports media type.
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/api/v1/items/sports/sport1", nil)
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("native item failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+
+	// Native streams must resolve for the sports item.
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/api/v1/items/sports/sport1/streams", nil)
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("native streams failed: %v status=%v", err, response.StatusCode)
+	}
+	var streams struct {
+		Streams []HubStream `json:"streams"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&streams); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(streams.Streams) != 1 {
+		t.Fatalf("expected one sports stream, got %#v", streams.Streams)
+	}
+
+	// A sports-only addon must still appear as a Jellyfin library, mapped to
+	// the "livetv" collection type.
+	authBody, _ := json.Marshal(map[string]string{"Username": "admin", "Pw": "secret-password"})
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/Users/AuthenticateByName", bytes.NewReader(authBody))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("Jellyfin auth failed: %v status=%v", err, response.StatusCode)
+	}
+	var jellyfinAuth struct {
+		User struct {
+			ID string `json:"Id"`
+		} `json:"User"`
+		AccessToken string `json:"AccessToken"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&jellyfinAuth); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/Users/"+jellyfinAuth.User.ID+"/Views", nil)
+	request.Header.Set("X-Emby-Token", jellyfinAuth.AccessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var views struct {
+		Items []struct {
+			ID             string `json:"Id"`
+			CollectionType string `json:"CollectionType"`
+		} `json:"Items"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(views.Items) != 1 || views.Items[0].CollectionType != "livetv" {
+		t.Fatalf("expected one livetv library for the sports catalog, got %#v", views.Items)
+	}
+}

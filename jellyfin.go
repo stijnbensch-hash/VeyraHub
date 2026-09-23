@@ -116,8 +116,11 @@ func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
 		for _, catalog := range addon.Catalogs {
 			id := encodeHubID(hubItemID{Kind: "library", AddonID: addon.ID, CatalogID: catalog.ID, MediaType: catalog.Type, Name: catalog.Name})
 			collectionType := "movies"
-			if catalog.Type == "series" {
+			switch catalog.Type {
+			case "series":
 				collectionType = "tvshows"
+			case "sports":
+				collectionType = "livetv"
 			}
 			items = append(items, map[string]any{
 				"Id": id, "Name": catalog.Name, "Type": "CollectionFolder", "CollectionType": collectionType,
@@ -322,7 +325,7 @@ func (h *Hub) searchCatalogs(ctx context.Context, query string) []map[string]any
 func (h *Hub) jellyfinItemsFromMetas(addonID string, metas []stremioMeta) []map[string]any {
 	result := make([]map[string]any, 0, len(metas))
 	for _, meta := range metas {
-		if meta.ID == "" || (meta.Type != "movie" && meta.Type != "series") {
+		if meta.ID == "" || !isMediaType(meta.Type) {
 			continue
 		}
 		payload := hubItemID{Kind: "item", AddonID: addonID, MediaType: meta.Type, MediaID: meta.ID, Name: meta.Name, Overview: meta.Description, Poster: meta.Poster, Backdrop: meta.Background, Year: metaYear(meta)}

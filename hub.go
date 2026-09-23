@@ -452,7 +452,7 @@ func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
 	base.Fragment = ""
 	catalogs := make([]AddonCatalog, 0, len(manifest.Catalogs))
 	for _, value := range manifest.Catalogs {
-		if value.ID == "" || (value.Type != "movie" && value.Type != "series") {
+		if value.ID == "" || !isMediaType(value.Type) {
 			continue
 		}
 		extra := make([]string, 0, len(value.Extra))
@@ -533,7 +533,7 @@ func (h *Hub) moveAddon(w http.ResponseWriter, r *http.Request) {
 func (h *Hub) streams(w http.ResponseWriter, r *http.Request) {
 	mediaType := r.PathValue("type")
 	id := r.PathValue("id")
-	if (mediaType != "movie" && mediaType != "series") || id == "" {
+	if !isMediaType(mediaType) || id == "" {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
 		return
 	}
@@ -641,7 +641,7 @@ func (h *Hub) fetchStreams(ctx context.Context, addon Addon, mediaType, id strin
 func (h *Hub) subtitles(w http.ResponseWriter, r *http.Request) {
 	mediaType := r.PathValue("type")
 	id := r.PathValue("id")
-	if (mediaType != "movie" && mediaType != "series") || id == "" {
+	if !isMediaType(mediaType) || id == "" {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
 		return
 	}

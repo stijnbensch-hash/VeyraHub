@@ -6,6 +6,16 @@ import (
 	"strings"
 )
 
+// isMediaType reports whether value is a media type the hub understands.
+// "sports" is a media type like "movie"/"series", not a separate addon
+// resource: a sports addon is just a catalog/meta/stream/subtitle provider
+// whose catalogs declare type "sports", so it flows through exactly the
+// same generic, resource-based capability system already used for movies
+// and series — nothing addon-facing is hardcoded to "sports" specifically.
+func isMediaType(value string) bool {
+	return value == "movie" || value == "series" || value == "sports"
+}
+
 // MediaCatalog is the neutral Hub representation of an addon catalog.
 // It contains no Jellyfin- or Veyra-specific fields.
 type MediaCatalog struct {
@@ -80,7 +90,7 @@ func mediaItemsFromMetas(addonID string, metas []stremioMeta) []MediaItem {
 	result := make([]MediaItem, 0, len(metas))
 
 	for _, meta := range metas {
-		if meta.ID == "" || (meta.Type != "movie" && meta.Type != "series") {
+		if meta.ID == "" || !isMediaType(meta.Type) {
 			continue
 		}
 		result = append(result, mediaItemFromMeta(addonID, meta))
@@ -137,7 +147,7 @@ func (h *Hub) mediaMetadata(
 	ctx context.Context,
 	preferredAddonID, mediaType, id string,
 ) (MediaItem, error) {
-	if mediaType != "movie" && mediaType != "series" {
+	if !isMediaType(mediaType) {
 		return MediaItem{}, errors.New("invalid media type")
 	}
 	if strings.TrimSpace(id) == "" {
