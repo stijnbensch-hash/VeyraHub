@@ -21,7 +21,7 @@ func (h *Hub) nativeCatalogs(w http.ResponseWriter, r *http.Request) {
 	addonID := strings.TrimSpace(r.URL.Query().Get("addonID"))
 	mediaType := strings.TrimSpace(r.URL.Query().Get("type"))
 
-	if mediaType != "" && mediaType != "movie" && mediaType != "series" {
+	if mediaType != "" && !isMediaType(mediaType) {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype.")
 		return
 	}
@@ -81,7 +81,7 @@ func (h *Hub) nativeCatalogs(w http.ResponseWriter, r *http.Request) {
 func (h *Hub) nativeCatalog(w http.ResponseWriter, r *http.Request) {
 	mediaType := r.PathValue("type")
 
-	if mediaType != "movie" && mediaType != "series" {
+	if !isMediaType(mediaType) {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype.")
 		return
 	}
@@ -136,7 +136,7 @@ func (h *Hub) nativeItem(w http.ResponseWriter, r *http.Request) {
 	mediaType := r.PathValue("type")
 	id := strings.TrimSpace(r.PathValue("id"))
 
-	if mediaType != "movie" && mediaType != "series" {
+	if !isMediaType(mediaType) {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype.")
 		return
 	}
@@ -164,7 +164,7 @@ func (h *Hub) nativeStreams(w http.ResponseWriter, r *http.Request) {
 	mediaType := r.PathValue("type")
 	id := strings.TrimSpace(r.PathValue("id"))
 
-	if (mediaType != "movie" && mediaType != "series") || id == "" {
+	if !isMediaType(mediaType) || id == "" {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
 		return
 	}
@@ -181,7 +181,7 @@ func (h *Hub) nativeSubtitles(w http.ResponseWriter, r *http.Request) {
 	mediaType := r.PathValue("type")
 	id := strings.TrimSpace(r.PathValue("id"))
 
-	if (mediaType != "movie" && mediaType != "series") || id == "" {
+	if !isMediaType(mediaType) || id == "" {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
 		return
 	}

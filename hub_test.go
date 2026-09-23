@@ -6,10 +6,51 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// TestLegacyAddonsMigrateToAdminAccount checks the one-time upgrade path for
+// a hub.json written by a build that still stored addons in a single global
+// list (the "addons" field), before they moved into the per-account
+// UserAddons model. On load, that legacy list must end up as the admin
+// account's addon set, not be silently dropped.
+func TestLegacyAddonsMigrateToAdminAccount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.json")
+
+	legacy := `{
+		"nodeID": "legacy-node",
+		"addons": [{"id": "old.addon", "name": "Oude bron", "manifestURL": "https://old.example/manifest.json", "baseURL": "https://old.example", "resources": ["stream"], "enabled": true}],
+		"users": [{"id": "admin-1", "username": "admin", "passwordHash": "pbkdf2-sha256$1$00$00", "role": "admin", "enabled": true}]
+	}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addons := store.AddonsForUser("admin-1")
+	if len(addons) != 1 || addons[0].ID != "old.addon" {
+		t.Fatalf("expected the legacy addon to migrate to the admin account, got %#v", addons)
+	}
+	if len(store.Snapshot().Addons) != 0 {
+		t.Fatalf("expected the legacy global addon list to be cleared after migration, got %#v", store.Snapshot().Addons)
+	}
+
+	// Migration must persist, not just live in memory.
+	reopened, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addons := reopened.AddonsForUser("admin-1"); len(addons) != 1 {
+		t.Fatalf("expected the migration to have been written to disk, got %#v", addons)
+	}
+}
 
 func TestValidateEndpoint(t *testing.T) {
 	valid := []string{"https://example.com/manifest.json", "http://127.0.0.1:7000/manifest.json", "http://addon.local/manifest.json"}
@@ -231,24 +272,175 @@ func TestAddonAndStreamAggregation(t *testing.T) {
 	}
 }
 
+// TestViewerSeesAdminAddedAddonCatalog guards against a regression where
+// addons are stored per-account: since only the admin ever manages addons,
+// a viewer account (which never has an addon list of its own) must still
+// see the admin's catalog and streams when browsing, both through the
+// Jellyfin bridge and the native API. Before addonCatalog() resolved every
+// consumer against the admin's addon set specifically, a viewer's own
+// (always-empty) addon bucket would have been used instead, silently
+// showing an empty library and no streams.
+func TestViewerSeesAdminAddedAddonCatalog(t *testing.T) {
+	addon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/manifest.json":
+			json.NewEncoder(w).Encode(map[string]any{
+				"id": "test.addon", "name": "Test bron", "version": "1.0",
+				"resources": []string{"catalog", "meta", "stream"},
+				"catalogs":  []any{map[string]any{"id": "popular", "type": "movie", "name": "Populair"}},
+			})
+		case "/catalog/movie/popular.json":
+			json.NewEncoder(w).Encode(map[string]any{"metas": []any{
+				map[string]any{"id": "tt123", "type": "movie", "name": "Voorbeeldfilm", "year": 2026},
+			}})
+		case "/stream/movie/tt123.json":
+			json.NewEncoder(w).Encode(map[string]any{"streams": []any{
+				map[string]any{"name": "4K", "url": "https://media.example/movie.m3u8"},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer addon.Close()
+
+	store := newTestStore(t)
+	hub := NewHub(store, "admin", "admin-secret-password", addon.Client())
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+
+	adminToken := adminLogin(t, server.URL, "admin-secret-password")
+
+	addBody, _ := json.Marshal(map[string]string{"manifestURL": addon.URL + "/manifest.json"})
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/addons", bytes.NewReader(addBody))
+	request.Header.Set("Authorization", "Bearer "+adminToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusCreated {
+		t.Fatalf("add addon failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+
+	createBody, _ := json.Marshal(map[string]string{"username": "kijker", "password": "kijker-wachtwoord"})
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/users", bytes.NewReader(createBody))
+	request.Header.Set("Authorization", "Bearer "+adminToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusCreated {
+		t.Fatalf("create viewer failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+
+	loginBody, _ := json.Marshal(map[string]string{"username": "kijker", "password": "kijker-wachtwoord"})
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/auth/login", bytes.NewReader(loginBody))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("viewer login failed: %v status=%v", err, response.StatusCode)
+	}
+	var viewerLogin struct {
+		AccessToken string `json:"accessToken"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&viewerLogin); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+
+	// Native API: the viewer must see the admin's catalog...
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/api/v1/catalogs", nil)
+	request.Header.Set("Authorization", "Bearer "+viewerLogin.AccessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("viewer catalog request failed: %v status=%v", err, response.StatusCode)
+	}
+	var catalogs struct {
+		Catalogs []MediaCatalog `json:"catalogs"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&catalogs); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(catalogs.Catalogs) != 1 {
+		t.Fatalf("expected viewer to see the admin's one catalog, got %d", len(catalogs.Catalogs))
+	}
+
+	// ...and its streams.
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/api/v1/items/movie/tt123/streams", nil)
+	request.Header.Set("Authorization", "Bearer "+viewerLogin.AccessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("viewer stream request failed: %v status=%v", err, response.StatusCode)
+	}
+	var streams struct {
+		Streams []HubStream `json:"streams"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&streams); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(streams.Streams) != 1 {
+		t.Fatalf("expected viewer to see one stream from the admin's addon, got %d", len(streams.Streams))
+	}
+
+	// And the Jellyfin bridge, which the Veyra app itself talks to.
+	authBody, _ := json.Marshal(map[string]string{"Username": "kijker", "Pw": "kijker-wachtwoord"})
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/Users/AuthenticateByName", bytes.NewReader(authBody))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("viewer Jellyfin auth failed: %v status=%v", err, response.StatusCode)
+	}
+	var jellyfinAuth struct {
+		User struct {
+			ID string `json:"Id"`
+		} `json:"User"`
+		AccessToken string `json:"AccessToken"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&jellyfinAuth); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/Users/"+jellyfinAuth.User.ID+"/Views", nil)
+	request.Header.Set("X-Emby-Token", jellyfinAuth.AccessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("viewer Jellyfin views request failed: %v status=%v", err, response.StatusCode)
+	}
+	var views struct {
+		Items []map[string]any `json:"Items"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(views.Items) != 1 {
+		t.Fatalf("expected viewer to see one Jellyfin library, got %d", len(views.Items))
+	}
+}
+
 func TestAddonHealthRecordsSanitizedFailure(t *testing.T) {
 	addonURL := "http://127.0.0.1:1" // nothing listens here: connection refused
 	store, err := NewStore(filepath.Join(t.TempDir(), "hub.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	hub := NewHub(store, "admin", "secret-password", nil)
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+	accessToken := adminLogin(t, server.URL, "secret-password")
+
 	// Seed a broken addon directly (bypassing addAddon, which would fail to
 	// fetch its manifest) so we can exercise the stream-failure health path.
-	if err := store.PutAddon(Addon{
+	adminID, ok := store.AdminUserID()
+	if !ok {
+		t.Fatal("expected bootstrap to have created an admin account")
+	}
+	if err := store.PutAddonForUser(adminID, Addon{
 		ID: "broken", Name: "Kapotte bron", BaseURL: addonURL,
 		ManifestURL: addonURL + "/manifest.json", Resources: []string{"stream"}, Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	hub := NewHub(store, "admin", "secret-password", nil)
-	server := httptest.NewServer(hub.Routes())
-	defer server.Close()
-	accessToken := adminLogin(t, server.URL, "secret-password")
 
 	request, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/streams/movie/tt999", nil)
 	request.Header.Set("Authorization", "Bearer "+accessToken)
@@ -296,17 +488,21 @@ func TestStreamAggregationOnlyCallsStreamCapableAddons(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutAddon(Addon{
+	hub := NewHub(store, "admin", "secret-password", nil)
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+	accessToken := adminLogin(t, server.URL, "secret-password")
+
+	adminID, ok := store.AdminUserID()
+	if !ok {
+		t.Fatal("expected bootstrap to have created an admin account")
+	}
+	if err := store.PutAddonForUser(adminID, Addon{
 		ID: "meta-only", Name: "Metadata-only bron", BaseURL: metaOnlyAddon.URL,
 		ManifestURL: metaOnlyAddon.URL + "/manifest.json", Resources: []string{"catalog", "meta"}, Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	hub := NewHub(store, "admin", "secret-password", nil)
-	server := httptest.NewServer(hub.Routes())
-	defer server.Close()
-	accessToken := adminLogin(t, server.URL, "secret-password")
 
 	request, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/streams/movie/tt1", nil)
 	request.Header.Set("Authorization", "Bearer "+accessToken)
@@ -344,23 +540,27 @@ func TestSubtitleAggregationOnlyCallsSubtitleCapableAddons(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutAddon(Addon{
+	hub := NewHub(store, "admin", "secret-password", nil)
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+	accessToken := adminLogin(t, server.URL, "secret-password")
+
+	adminID, ok := store.AdminUserID()
+	if !ok {
+		t.Fatal("expected bootstrap to have created an admin account")
+	}
+	if err := store.PutAddonForUser(adminID, Addon{
 		ID: "stream-only", Name: "Stream-only bron", BaseURL: streamOnlyAddon.URL,
 		ManifestURL: streamOnlyAddon.URL + "/manifest.json", Resources: []string{"stream"}, Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutAddon(Addon{
+	if err := store.PutAddonForUser(adminID, Addon{
 		ID: "subs", Name: "Ondertitelbron", BaseURL: subtitleAddon.URL,
 		ManifestURL: subtitleAddon.URL + "/manifest.json", Resources: []string{"subtitles"}, Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	hub := NewHub(store, "admin", "secret-password", nil)
-	server := httptest.NewServer(hub.Routes())
-	defer server.Close()
-	accessToken := adminLogin(t, server.URL, "secret-password")
 
 	request, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/subtitles/movie/tt1", nil)
 	request.Header.Set("Authorization", "Bearer "+accessToken)
@@ -697,5 +897,139 @@ func TestNativeSearchRejectsEmptyQuery(t *testing.T) {
 
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", response.StatusCode)
+	}
+}
+
+// TestSportsCapabilityFlowsThroughGenericRoutes guards the "sports" media
+// type: it must be treated exactly like "movie"/"series" by every generic
+// resource-based route (native catalogs/items/streams/subtitles and the
+// Jellyfin bridge's library views), without any addon-facing special case.
+func TestSportsCapabilityFlowsThroughGenericRoutes(t *testing.T) {
+	addon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/manifest.json":
+			json.NewEncoder(w).Encode(map[string]any{
+				"id": "test.sports", "name": "Sportbron", "version": "1.0",
+				"resources": []string{"catalog", "meta", "stream"},
+				"catalogs":  []any{map[string]any{"id": "live", "type": "sports", "name": "Live sport"}},
+			})
+		case "/catalog/sports/live.json":
+			json.NewEncoder(w).Encode(map[string]any{"metas": []any{
+				map[string]any{"id": "sport1", "type": "sports", "name": "Wedstrijd"},
+			}})
+		case "/meta/sports/sport1.json":
+			json.NewEncoder(w).Encode(map[string]any{"meta": map[string]any{
+				"id": "sport1", "type": "sports", "name": "Wedstrijd",
+			}})
+		case "/stream/sports/sport1.json":
+			json.NewEncoder(w).Encode(map[string]any{"streams": []any{
+				map[string]any{"name": "HD", "url": "https://media.example/live.m3u8"},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer addon.Close()
+
+	store := newTestStore(t)
+	hub := NewHub(store, "admin", "secret-password", addon.Client())
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+
+	accessToken := adminLogin(t, server.URL, "secret-password")
+
+	body, _ := json.Marshal(map[string]string{"manifestURL": addon.URL + "/manifest.json"})
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/addons", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusCreated {
+		t.Fatalf("add addon failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+
+	// Native catalogs must surface the sports catalog.
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/api/v1/catalogs?type=sports", nil)
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("native catalogs failed: %v status=%v", err, response.StatusCode)
+	}
+	var catalogs struct {
+		Catalogs []MediaCatalog `json:"catalogs"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&catalogs); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(catalogs.Catalogs) != 1 || catalogs.Catalogs[0].Type != "sports" {
+		t.Fatalf("expected one sports catalog, got %#v", catalogs.Catalogs)
+	}
+
+	// Native item lookup must accept the sports media type.
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/api/v1/items/sports/sport1", nil)
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("native item failed: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+
+	// Native streams must resolve for the sports item.
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/api/v1/items/sports/sport1/streams", nil)
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("native streams failed: %v status=%v", err, response.StatusCode)
+	}
+	var streams struct {
+		Streams []HubStream `json:"streams"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&streams); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(streams.Streams) != 1 {
+		t.Fatalf("expected one sports stream, got %#v", streams.Streams)
+	}
+
+	// A sports-only addon must still appear as a Jellyfin library, mapped to
+	// the "livetv" collection type.
+	authBody, _ := json.Marshal(map[string]string{"Username": "admin", "Pw": "secret-password"})
+	request, _ = http.NewRequest(http.MethodPost, server.URL+"/Users/AuthenticateByName", bytes.NewReader(authBody))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("Jellyfin auth failed: %v status=%v", err, response.StatusCode)
+	}
+	var jellyfinAuth struct {
+		User struct {
+			ID string `json:"Id"`
+		} `json:"User"`
+		AccessToken string `json:"AccessToken"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&jellyfinAuth); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/Users/"+jellyfinAuth.User.ID+"/Views", nil)
+	request.Header.Set("X-Emby-Token", jellyfinAuth.AccessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var views struct {
+		Items []struct {
+			ID             string `json:"Id"`
+			CollectionType string `json:"CollectionType"`
+		} `json:"Items"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(views.Items) != 1 || views.Items[0].CollectionType != "livetv" {
+		t.Fatalf("expected one livetv library for the sports catalog, got %#v", views.Items)
 	}
 }

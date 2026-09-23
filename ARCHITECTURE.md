@@ -46,6 +46,19 @@ buildtargets en gegevensopslag van de Veyra-client.
   addon die geen `stream` levert kan toch ondertiteltracks aanleveren, en
   omgekeerd — de hub combineert beide onafhankelijk van elkaar.
 
+## Mediatypes
+
+- de hub kent drie mediatypes: `movie`, `series` en `sports`;
+- `sports` is geen apart addonresource of speciaal geval, maar gewoon een
+  derde waarde die overal waar `movie`/`series` wordt gecontroleerd evenveel
+  geldig is (`isMediaType` in `core.go`) — catalogus-, meta-, stream- en
+  ondertitelroutes zijn generiek op resource, niet op mediatype, dus een
+  addon dat een `"sports"`-catalogus meldt werkt zonder verdere aanpassing;
+- in de Jellyfin-compatibiliteitslaag wordt een `sports`-catalogus vertaald
+  naar een bibliotheek van het type `livetv`; de afleveringsspecifieke
+  paden (season/episode) blijven exclusief voor `series` en raken
+  `sports`-items niet.
+
 ## Beveiligingsgrenzen
 
 - elk account (beheer en kijker) logt in met gebruikersnaam + wachtwoord;

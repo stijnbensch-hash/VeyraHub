@@ -65,10 +65,17 @@ De volgende routes zijn beschikbaar voor de huidige Veyra-client:
 
 - serverinformatie en aanmelden;
 - bibliotheken op basis van addoncatalogi;
-- film-, serie- en afleveringslijsten;
+- film-, serie-, sport- en afleveringslijsten;
 - zoeken in catalogi die de `search`-extra ondersteunen;
 - poster- en backdropdoorverwijzingen;
 - directe videostreams via een beveiligde server-URL.
+
+"Sports" is geen apart addontype maar gewoon een derde mediatype naast
+`movie`/`series`: een addon levert een sportcatalogus door in zijn manifest
+een catalogus met `"type": "sports"` op te geven, en die stroomt daarna door
+dezelfde generieke catalog/meta/stream/subtitles-routes als films en series.
+In de Jellyfin-compatibiliteitslaag verschijnt zo'n catalogus als een
+bibliotheek van het type `livetv`.
 
 Dit is een doelgerichte compatibiliteitslaag en nog geen volledige implementatie
 van iedere Jellyfin-route. Andere Jellyfin-clients kunnen daarom deels werken,
@@ -102,8 +109,14 @@ maar zijn in deze versie niet allemaal gegarandeerd.
 - `GET|POST /v1/users` — persoonlijke kijkaccounts bekijken/toevoegen. *(beheer)*
 - `PATCH|DELETE /v1/users/{id}` — een kijkaccount pauzeren, wachtwoord
   resetten of verwijderen. *(beheer)*
-- `GET /v1/streams/{movie|series}/{imdb-id}` — directe streams samenvoegen, alleen van addons die `stream` als resource opgeven. *(beheer)*
-- `GET /v1/subtitles/{movie|series}/{imdb-id}` — ondertiteltracks samenvoegen, alleen van addons die `subtitles` als resource opgeven. Losstaand van streams: eender welk aantal ondertiteladdons kan tracks leveren, ongeacht welke addon de video zelf leverde. *(beheer)*
+- `GET /v1/streams/{movie|series|sports}/{imdb-id}` — directe streams samenvoegen, alleen van addons die `stream` als resource opgeven. *(beheer)*
+- `GET /v1/subtitles/{movie|series|sports}/{imdb-id}` — ondertiteltracks samenvoegen, alleen van addons die `subtitles` als resource opgeven. Losstaand van streams: eender welk aantal ondertiteladdons kan tracks leveren, ongeacht welke addon de video zelf leverde. *(beheer)*
+- `GET /api/v1/catalogs`, `GET /api/v1/catalog/{addonID}/{movie|series|sports}/{catalogID}`,
+  `GET /api/v1/items/{movie|series|sports}/{id}`,
+  `GET /api/v1/items/{movie|series|sports}/{id}/streams`,
+  `GET /api/v1/items/{movie|series|sports}/{id}/subtitles` — de native API
+  van de hub: neemt een ruwe (bijv. IMDb-stijl) id direct aan, zonder eerst
+  een catalogus te doorzoeken.
 
 Routes gemarkeerd *(beheer)* vereisen `Authorization: Bearer <accessToken>`
 van een ingelogd beheeraccount; de rest van de `/v1`-routes vereist alleen een
