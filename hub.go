@@ -164,6 +164,31 @@ func bearerToken(r *http.Request) string {
 	return strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 }
 
+// addonCatalog returns the hub's shared addon catalog: the admin account's
+// addon list. Addons are stored per-account in the data model, but only the
+// admin manages them, so every consumer (admin dashboard, Jellyfin bridge,
+// or native API — whichever account is asking) resolves against this same
+// list rather than the requesting account's own, otherwise viewer accounts
+// (which never have addons of their own) would see none at all.
+func (h *Hub) addonCatalog() []Addon {
+	adminID, ok := h.store.AdminUserID()
+	if !ok {
+		return nil
+	}
+	return h.store.AddonsForUser(adminID)
+}
+
+// recordAddonHealth is the addon-health counterpart of addonCatalog: health
+// is always recorded against the admin's copy of the addon, regardless of
+// which account's request triggered the call.
+func (h *Hub) recordAddonHealth(id string, ok bool, message string) {
+	adminID, found := h.store.AdminUserID()
+	if !found {
+		return
+	}
+	h.store.RecordAddonHealthForUser(adminID, id, ok, message)
+}
+
 func (h *Hub) index(w http.ResponseWriter, r *http.Request) {
 	data, err := webFiles.ReadFile("web/index.html")
 	if err != nil {
@@ -251,8 +276,9 @@ func publicUser(user User) map[string]any {
 
 func (h *Hub) status(w http.ResponseWriter, r *http.Request) {
 	state := h.store.Snapshot()
+	addons := h.addonCatalog()
 	enabled := 0
-	for _, addon := range state.Addons {
+	for _, addon := range addons {
 		if addon.Enabled {
 			enabled++
 		}
@@ -265,7 +291,7 @@ func (h *Hub) status(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "Veyra Hub", "version": version, "nodeID": state.NodeID,
-		"addonCount": len(state.Addons), "enabledAddonCount": enabled,
+		"addonCount": len(addons), "enabledAddonCount": enabled,
 		"viewerCount": viewers, "username": h.username, "jellyfinCompatible": true,
 	})
 }
@@ -379,7 +405,7 @@ func (h *Hub) deleteUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Hub) listAddons(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"addons": h.store.Snapshot().Addons})
+	writeJSON(w, http.StatusOK, map[string]any{"addons": h.addonCatalog()})
 }
 
 func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
@@ -455,7 +481,8 @@ func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
 		BaseURL: baseURL, ConfigureURL: configureURL, Resources: resources, Catalogs: catalogs,
 		Enabled: true, AddedAt: time.Now().UTC(), Reachable: true,
 	}
-	if err := h.store.PutAddon(addon); err != nil {
+	admin, _ := r.Context().Value(ctxUserKey).(User)
+	if err := h.store.PutAddonForUser(admin.ID, addon); err != nil {
 		writeError(w, http.StatusInternalServerError, "De addon kon niet worden opgeslagen.")
 		return
 	}
@@ -470,7 +497,8 @@ func (h *Hub) patchAddon(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Geef enabled op.")
 		return
 	}
-	if err := h.store.SetEnabled(r.PathValue("id"), *input.Enabled); err != nil {
+	admin, _ := r.Context().Value(ctxUserKey).(User)
+	if err := h.store.SetAddonEnabledForUser(admin.ID, r.PathValue("id"), *input.Enabled); err != nil {
 		writeError(w, http.StatusNotFound, "Addon niet gevonden.")
 		return
 	}
@@ -478,7 +506,8 @@ func (h *Hub) patchAddon(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Hub) deleteAddon(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.DeleteAddon(r.PathValue("id")); err != nil {
+	admin, _ := r.Context().Value(ctxUserKey).(User)
+	if err := h.store.DeleteAddonForUser(admin.ID, r.PathValue("id")); err != nil {
 		writeError(w, http.StatusNotFound, "Addon niet gevonden.")
 		return
 	}
@@ -493,7 +522,8 @@ func (h *Hub) moveAddon(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Gebruik richting -1 of 1.")
 		return
 	}
-	if err := h.store.MoveAddon(r.PathValue("id"), input.Direction); err != nil {
+	admin, _ := r.Context().Value(ctxUserKey).(User)
+	if err := h.store.MoveAddonForUser(admin.ID, r.PathValue("id"), input.Direction); err != nil {
 		writeError(w, http.StatusNotFound, "Addon niet gevonden.")
 		return
 	}
@@ -513,9 +543,9 @@ func (h *Hub) streams(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubStream {
-	state := h.store.Snapshot()
+	addons := h.addonCatalog()
 	var enabled []Addon
-	for _, addon := range state.Addons {
+	for _, addon := range addons {
 		// Only ask addons that actually declared the "stream" capability.
 		// Calling every enabled addon regardless of what it supports wastes
 		// requests and pollutes health/status with failures from addons
@@ -537,9 +567,9 @@ func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubS
 			defer wg.Done()
 			values, err := h.fetchStreams(ctx, addon, mediaType, id)
 			if err != nil {
-				h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
 			} else {
-				h.store.RecordAddonHealth(addon.ID, true, "")
+				h.recordAddonHealth(addon.ID, true, "")
 			}
 			results <- result{values, err}
 		}(addon)
@@ -556,7 +586,7 @@ func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubS
 	}
 	values = deduplicateStreams(values)
 	rank := map[string]int{}
-	for index, addon := range state.Addons {
+	for index, addon := range addons {
 		rank[addon.ID] = index
 	}
 	sort.SliceStable(values, func(i, j int) bool { return rank[values[i].AddonID] < rank[values[j].AddonID] })
@@ -626,9 +656,8 @@ func (h *Hub) subtitles(w http.ResponseWriter, r *http.Request) {
 // into streams) so any number of subtitle addons can serve a title
 // independently of which addon resolved the video itself.
 func (h *Hub) aggregateSubtitles(ctx context.Context, mediaType, id string) []HubSubtitle {
-	state := h.store.Snapshot()
 	var enabled []Addon
-	for _, addon := range state.Addons {
+	for _, addon := range h.addonCatalog() {
 		if addon.Enabled && contains(addon.Resources, "subtitles") {
 			enabled = append(enabled, addon)
 		}
@@ -646,9 +675,9 @@ func (h *Hub) aggregateSubtitles(ctx context.Context, mediaType, id string) []Hu
 			defer wg.Done()
 			values, err := h.fetchSubtitles(ctx, addon, mediaType, id)
 			if err != nil {
-				h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
 			} else {
-				h.store.RecordAddonHealth(addon.ID, true, "")
+				h.recordAddonHealth(addon.ID, true, "")
 			}
 			results <- result{values, err}
 		}(addon)

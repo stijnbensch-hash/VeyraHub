@@ -52,13 +52,13 @@ func (h *Hub) fetchCatalog(ctx context.Context, addon Addon, catalog AddonCatalo
 	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
 	response, err := h.client.Do(request)
 	if err != nil {
-		h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+		h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
 		return nil, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		err := fmt.Errorf("catalog HTTP %d", response.StatusCode)
-		h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+		h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
 		return nil, err
 	}
 	var payload struct {
@@ -66,9 +66,9 @@ func (h *Hub) fetchCatalog(ctx context.Context, addon Addon, catalog AddonCatalo
 	}
 	err = json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&payload)
 	if err != nil {
-		h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+		h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
 	} else {
-		h.store.RecordAddonHealth(addon.ID, true, "")
+		h.recordAddonHealth(addon.ID, true, "")
 	}
 	return payload.Metas, err
 }
@@ -79,7 +79,7 @@ func (h *Hub) fetchMeta(ctx context.Context, preferredAddonID, mediaType, id str
 }
 
 func (h *Hub) fetchMetaWithSource(ctx context.Context, preferredAddonID, mediaType, id string) (stremioMeta, string, error) {
-	addons := h.store.Snapshot().Addons
+	addons := h.addonCatalog()
 
 	for pass := 0; pass < 2; pass++ {
 		for _, addon := range addons {
@@ -101,13 +101,13 @@ func (h *Hub) fetchMetaWithSource(ctx context.Context, preferredAddonID, mediaTy
 
 			response, err := h.client.Do(request)
 			if err != nil {
-				h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
 				continue
 			}
 
 			if response.StatusCode < 200 || response.StatusCode >= 300 {
 				response.Body.Close()
-				h.store.RecordAddonHealth(
+				h.recordAddonHealth(
 					addon.ID,
 					false,
 					fmt.Sprintf("metadata request returned HTTP %d", response.StatusCode),
@@ -123,16 +123,16 @@ func (h *Hub) fetchMetaWithSource(ctx context.Context, preferredAddonID, mediaTy
 			response.Body.Close()
 
 			if err != nil {
-				h.store.RecordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
 				continue
 			}
 
 			if payload.Meta.ID == "" {
-				h.store.RecordAddonHealth(addon.ID, false, "metadata response contained no media item")
+				h.recordAddonHealth(addon.ID, false, "metadata response contained no media item")
 				continue
 			}
 
-			h.store.RecordAddonHealth(addon.ID, true, "")
+			h.recordAddonHealth(addon.ID, true, "")
 			return payload.Meta, addon.ID, nil
 		}
 	}

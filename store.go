@@ -97,12 +97,18 @@ func (s Session) active(now time.Time) bool {
 	return s.RevokedAt == nil && now.Before(s.RefreshExpiresAt)
 }
 
+type UserAddonSet struct {
+	UserID string  `json:"userID"`
+	Addons []Addon `json:"addons"`
+}
+
 type State struct {
-	NodeID    string          `json:"nodeID"`
-	Addons    []Addon         `json:"addons"`
-	Users     []User          `json:"users,omitempty"`
-	Sessions  []Session       `json:"sessions,omitempty"`
-	VeyraSync []VeyraUserSync `json:"veyraSync,omitempty"`
+	NodeID     string          `json:"nodeID"`
+	Addons     []Addon         `json:"addons,omitempty"`
+	UserAddons []UserAddonSet  `json:"userAddons,omitempty"`
+	Users      []User          `json:"users,omitempty"`
+	Sessions   []Session       `json:"sessions,omitempty"`
+	VeyraSync  []VeyraUserSync `json:"veyraSync,omitempty"`
 }
 
 type Store struct {
@@ -121,8 +127,15 @@ func NewStore(path string) (*Store, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	dirty := false
 	if s.state.NodeID == "" {
 		s.state.NodeID = randomID()
+		dirty = true
+	}
+	if s.migrateLegacyAddons() {
+		dirty = true
+	}
+	if dirty {
 		if err := s.persistLocked(); err != nil {
 			return nil, err
 		}
@@ -130,15 +143,74 @@ func NewStore(path string) (*Store, error) {
 	return s, nil
 }
 
+// migrateLegacyAddons moves addons from the old global "addons" list (used
+// before addons moved into the per-account data model) into the admin
+// account's addon set. This is a one-time upgrade path for a hub.json
+// written by an older build; it's a no-op once the global list is empty,
+// which is every run after the first on an upgraded hub. Called from
+// NewStore before any concurrent access starts, so it touches state
+// directly without locking.
+func (s *Store) migrateLegacyAddons() bool {
+	if len(s.state.Addons) == 0 {
+		return false
+	}
+	var adminID string
+	for _, user := range s.state.Users {
+		if user.Role == RoleAdmin {
+			adminID = user.ID
+			break
+		}
+	}
+	if adminID == "" {
+		// No admin account yet (shouldn't normally happen alongside a
+		// populated legacy addon list); leave it in place and retry on
+		// the next start rather than silently discarding it.
+		return false
+	}
+	set := s.ensureUserAddonsLocked(adminID)
+	set.Addons = append(set.Addons, s.state.Addons...)
+	s.state.Addons = nil
+	return true
+}
+
+// AdminUserID returns the id of the hub's single admin account. Addons are
+// stored per-account, but only the admin manages them, so every consumer —
+// admin or viewer, Jellyfin bridge or native API — resolves the shared
+// addon catalog against this id rather than the requesting account's own.
+func (s *Store) AdminUserID() (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, user := range s.state.Users {
+		if user.Role == RoleAdmin {
+			return user.ID, true
+		}
+	}
+	return "", false
+}
+
 func (s *Store) Snapshot() State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
 	copyState := s.state
 	copyState.Addons = append([]Addon{}, s.state.Addons...)
+	copyState.UserAddons = cloneUserAddonSets(s.state.UserAddons)
 	copyState.Users = append([]User{}, s.state.Users...)
 	copyState.Sessions = append([]Session{}, s.state.Sessions...)
 	copyState.VeyraSync = append([]VeyraUserSync{}, s.state.VeyraSync...)
+
 	return copyState
+}
+
+func cloneUserAddonSets(values []UserAddonSet) []UserAddonSet {
+	result := make([]UserAddonSet, len(values))
+
+	for i, value := range values {
+		result[i] = value
+		result[i].Addons = append([]Addon{}, value.Addons...)
+	}
+
+	return result
 }
 
 // HasUsers reports whether any account has been created yet, used to decide
@@ -423,85 +495,162 @@ func (s *Store) AllSessions() []Session {
 	return result
 }
 
-func (s *Store) PutAddon(addon Addon) error {
+func (s *Store) userAddonIndexLocked(userID string) int {
+	for i := range s.state.UserAddons {
+		if s.state.UserAddons[i].UserID == userID {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *Store) ensureUserAddonsLocked(userID string) *UserAddonSet {
+	index := s.userAddonIndexLocked(userID)
+	if index >= 0 {
+		return &s.state.UserAddons[index]
+	}
+
+	s.state.UserAddons = append(s.state.UserAddons, UserAddonSet{
+		UserID: userID,
+		Addons: []Addon{},
+	})
+
+	return &s.state.UserAddons[len(s.state.UserAddons)-1]
+}
+
+func (s *Store) AddonsForUser(userID string) []Addon {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	index := s.userAddonIndexLocked(userID)
+	if index < 0 {
+		return []Addon{}
+	}
+
+	return append([]Addon{}, s.state.UserAddons[index].Addons...)
+}
+
+func (s *Store) PutAddonForUser(userID string, addon Addon) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.state.Addons {
-		if s.state.Addons[i].ID == addon.ID {
-			addon.AddedAt = s.state.Addons[i].AddedAt
-			s.state.Addons[i] = addon
+
+	set := s.ensureUserAddonsLocked(userID)
+
+	for i := range set.Addons {
+		if set.Addons[i].ID == addon.ID {
+			addon.AddedAt = set.Addons[i].AddedAt
+			set.Addons[i] = addon
 			return s.persistLocked()
 		}
 	}
-	s.state.Addons = append(s.state.Addons, addon)
+
+	set.Addons = append(set.Addons, addon)
 	return s.persistLocked()
 }
 
-func (s *Store) SetEnabled(id string, enabled bool) error {
+func (s *Store) SetAddonEnabledForUser(userID, id string, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.state.Addons {
-		if s.state.Addons[i].ID == id {
-			s.state.Addons[i].Enabled = enabled
+
+	index := s.userAddonIndexLocked(userID)
+	if index < 0 {
+		return os.ErrNotExist
+	}
+
+	for i := range s.state.UserAddons[index].Addons {
+		if s.state.UserAddons[index].Addons[i].ID == id {
+			s.state.UserAddons[index].Addons[i].Enabled = enabled
 			return s.persistLocked()
 		}
 	}
+
 	return os.ErrNotExist
 }
 
-// RecordAddonHealth updates an addon's observed reachability after the hub
-// calls it (a catalog, meta, or stream request). success/failure are
-// recorded independently so a dashboard can show "reachable but last call
-// failed" or vice versa. message is a short, already-sanitized description
-// (no addon URLs or query strings); callers must sanitize before passing it.
-// A miss (addon deleted concurrently) is silently ignored: health is
-// best-effort telemetry, not something a caller should fail over.
-func (s *Store) RecordAddonHealth(id string, ok bool, message string) {
+func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message string) {
 	now := time.Now().UTC()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.state.Addons {
-		if s.state.Addons[i].ID != id {
+
+	index := s.userAddonIndexLocked(userID)
+	if index < 0 {
+		return
+	}
+
+	for i := range s.state.UserAddons[index].Addons {
+		addon := &s.state.UserAddons[index].Addons[i]
+		if addon.ID != id {
 			continue
 		}
-		s.state.Addons[i].Reachable = ok
+
+		addon.Reachable = ok
+
 		if ok {
-			s.state.Addons[i].LastSuccessAt = &now
+			addon.LastSuccessAt = &now
 		} else {
-			s.state.Addons[i].LastErrorAt = &now
-			s.state.Addons[i].LastError = message
+			addon.LastErrorAt = &now
+			addon.LastError = message
 		}
+
 		_ = s.persistLocked()
 		return
 	}
 }
 
-func (s *Store) DeleteAddon(id string) error {
+func (s *Store) DeleteAddonForUser(userID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.state.Addons {
-		if s.state.Addons[i].ID == id {
-			s.state.Addons = append(s.state.Addons[:i], s.state.Addons[i+1:]...)
+
+	index := s.userAddonIndexLocked(userID)
+	if index < 0 {
+		return os.ErrNotExist
+	}
+
+	addons := s.state.UserAddons[index].Addons
+
+	for i := range addons {
+		if addons[i].ID == id {
+			s.state.UserAddons[index].Addons =
+				append(addons[:i], addons[i+1:]...)
+
 			return s.persistLocked()
 		}
 	}
+
 	return os.ErrNotExist
 }
 
-func (s *Store) MoveAddon(id string, direction int) error {
+func (s *Store) MoveAddonForUser(userID, id string, direction int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for index := range s.state.Addons {
-		if s.state.Addons[index].ID != id {
+
+	index := s.userAddonIndexLocked(userID)
+	if index < 0 {
+		return os.ErrNotExist
+	}
+
+	addons := s.state.UserAddons[index].Addons
+
+	for current := range addons {
+		if addons[current].ID != id {
 			continue
 		}
-		target := index + direction
-		if target < 0 || target >= len(s.state.Addons) {
+
+		target := current + direction
+
+		if target < 0 || target >= len(addons) {
 			return nil
 		}
-		s.state.Addons[index], s.state.Addons[target] = s.state.Addons[target], s.state.Addons[index]
+
+		addons[current], addons[target] =
+			addons[target], addons[current]
+
+		s.state.UserAddons[index].Addons = addons
+
 		return s.persistLocked()
 	}
+
 	return os.ErrNotExist
 }
 

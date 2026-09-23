@@ -90,10 +90,9 @@ func mediaItemsFromMetas(addonID string, metas []stremioMeta) []MediaItem {
 }
 
 func (h *Hub) mediaCatalogs() []MediaCatalog {
-	state := h.store.Snapshot()
 	var result []MediaCatalog
 
-	for _, addon := range state.Addons {
+	for _, addon := range h.addonCatalog() {
 		if !addon.Enabled || !contains(addon.Resources, "catalog") {
 			continue
 		}
@@ -162,7 +161,7 @@ func (h *Hub) mediaSearch(ctx context.Context, query string) []MediaItem {
 	var result []MediaItem
 	seen := map[string]bool{}
 
-	for _, addon := range h.store.Snapshot().Addons {
+	for _, addon := range h.addonCatalog() {
 		if !addon.Enabled || !contains(addon.Resources, "catalog") {
 			continue
 		}
