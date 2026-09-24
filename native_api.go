@@ -6,6 +6,32 @@ import (
 	"strings"
 )
 
+// resolveNativeMediaID accepts either a plain lookup id (e.g. the IMDb id
+// convention VeyraHubNativeClient uses for addon-catalog items) or a
+// hubItemID blob (what an item that came through the Jellyfin bridge
+// carries as its id — see encodeHubID/decodeHubID in jellyfin.go) and
+// returns the id/type an addon's own stream endpoint actually expects.
+//
+// Without this, a mediaserver-shelf item without an IMDb id — a live
+// sports event from an addon like SeriousSportSync is the case that
+// surfaced this — reaches this API with its encoded hubItemID as `id`.
+// aggregateStreams forwards that `id` to every addon's stream endpoint
+// verbatim, so an addon that only understands its own catalog ids (e.g.
+// "nfl:2026-...") gets a base64 blob it can't parse and returns zero
+// streams — the addon IS called (it passes the "stream" resource check),
+// it just never gets an id it recognizes.
+func resolveNativeMediaID(mediaType, id string) (string, string) {
+	decoded, err := decodeHubID(id)
+	if err != nil || decoded.MediaID == "" {
+		return mediaType, id
+	}
+	resolvedType := mediaType
+	if decoded.MediaType != "" {
+		resolvedType = decoded.MediaType
+	}
+	return resolvedType, decoded.MediaID
+}
+
 func (h *Hub) registerNativeRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/catalogs", h.requireSession(h.nativeCatalogs))
 	mux.HandleFunc("GET /api/v1/catalog/{addonID}/{type}/{catalogID}", h.requireSession(h.nativeCatalog))
@@ -149,6 +175,8 @@ func (h *Hub) nativeItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mediaType, id = resolveNativeMediaID(mediaType, id)
+
 	item, err := h.mediaMetadata(
 		r.Context(),
 		strings.TrimSpace(r.URL.Query().Get("addonID")),
@@ -176,6 +204,8 @@ func (h *Hub) nativeStreams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mediaType, id = resolveNativeMediaID(mediaType, id)
+
 	values := h.aggregateStreams(r.Context(), mediaType, id)
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -192,6 +222,8 @@ func (h *Hub) nativeSubtitles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
 		return
 	}
+
+	mediaType, id = resolveNativeMediaID(mediaType, id)
 
 	values := h.aggregateSubtitles(r.Context(), mediaType, id)
 
