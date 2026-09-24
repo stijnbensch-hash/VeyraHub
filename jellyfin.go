@@ -114,7 +114,20 @@ func embyAuthFields(header string) map[string]string {
 	return fields
 }
 
+// jellyfinViews lists every browsable library as a Jellyfin "View" —
+// one per addon catalog, smart collection and local/WebDAV source. Each
+// entry also carries "GroupId"/"GroupName", a Veyra-Hub-specific extension
+// (real Jellyfin clients simply ignore unknown fields) so a client can
+// group libraries by where they come from — e.g. show an addon picker
+// before a catalog picker, the way the native API already exposes addons
+// separately. Smart collections and local sources aren't addons, so they
+// get a fixed, synthetic group instead of an addon id/name.
 func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
+	const smartCollectionsGroupID = "smart-collections"
+	const smartCollectionsGroupName = "Slimme collecties"
+	const localSourcesGroupID = "local-sources"
+	const localSourcesGroupName = "Lokaal & WebDAV"
+
 	var items []map[string]any
 	for _, addon := range h.addonCatalog() {
 		if !addon.Enabled {
@@ -131,6 +144,7 @@ func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
 			}
 			items = append(items, map[string]any{
 				"Id": id, "Name": catalog.Name, "Type": "CollectionFolder", "CollectionType": collectionType,
+				"GroupId": addon.ID, "GroupName": addon.Name,
 			})
 		}
 	}
@@ -145,6 +159,7 @@ func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, map[string]any{
 			"Id": id, "Name": collection.Name, "Type": "CollectionFolder", "CollectionType": collectionType,
+			"GroupId": smartCollectionsGroupID, "GroupName": smartCollectionsGroupName,
 		})
 	}
 	for _, source := range h.store.Sources() {
@@ -154,6 +169,7 @@ func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
 		id := encodeHubID(hubItemID{Kind: "localSource", AddonID: source.ID, Name: source.Name})
 		items = append(items, map[string]any{
 			"Id": id, "Name": source.Name, "Type": "CollectionFolder", "CollectionType": "movies",
+			"GroupId": localSourcesGroupID, "GroupName": localSourcesGroupName,
 		})
 	}
 	if items == nil {
