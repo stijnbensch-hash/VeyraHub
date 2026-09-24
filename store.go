@@ -452,6 +452,20 @@ func (s *Store) PutAddon(addon Addon) error {
 	return s.persistLocked()
 }
 
+// FindAddon returns a copy of the addon with this id, for callers that need
+// its current fields (e.g. ManifestURL) before recomputing them — such as a
+// manifest refresh, which must know where to re-fetch from.
+func (s *Store) FindAddon(id string) (Addon, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, addon := range s.state.Addons {
+		if addon.ID == id {
+			return addon, true
+		}
+	}
+	return Addon{}, false
+}
+
 func (s *Store) SetEnabled(id string, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

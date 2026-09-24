@@ -116,6 +116,7 @@ func (h *Hub) Routes() http.Handler {
 	mux.HandleFunc("DELETE /v1/sessions/{id}", h.requireAdmin(h.revokeSession))
 	mux.HandleFunc("GET /v1/addons", h.requireAdmin(h.listAddons))
 	mux.HandleFunc("POST /v1/addons", h.requireAdmin(h.addAddon))
+	mux.HandleFunc("POST /v1/addons/{id}/refresh", h.requireAdmin(h.refreshAddon))
 	mux.HandleFunc("PATCH /v1/addons/{id}", h.requireAdmin(h.patchAddon))
 	mux.HandleFunc("POST /v1/addons/{id}/move", h.requireAdmin(h.moveAddon))
 	mux.HandleFunc("DELETE /v1/addons/{id}", h.requireAdmin(h.deleteAddon))
@@ -382,43 +383,44 @@ func (h *Hub) listAddons(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"addons": h.store.Snapshot().Addons})
 }
 
-func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		ManifestURL string `json:"manifestURL"`
-	}
-	if err := decodeJSON(r, &input); err != nil {
-		writeError(w, http.StatusBadRequest, "Ongeldige aanvraag.")
-		return
-	}
-	manifestURL, err := validateEndpoint(input.ManifestURL)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+// resolvedAddonManifest holds everything addAddon/refreshAddon derive from
+// an addon's manifest.json — split out so both can share the same fetch and
+// parse logic instead of drifting out of sync.
+type resolvedAddonManifest struct {
+	ID           string
+	Name         string
+	Description  string
+	Version      string
+	BaseURL      string
+	ConfigureURL string
+	Resources    []string
+	Catalogs     []AddonCatalog
+}
 
-	request, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, manifestURL.String(), nil)
+// resolveAddonManifest fetches and parses an addon's manifest.json. On
+// failure it returns a non-zero HTTP status and a user-facing message
+// (rather than a Go error) so callers can pass both straight to writeError,
+// matching the rest of this file's style.
+func (h *Hub) resolveAddonManifest(ctx context.Context, manifestURL *url.URL) (resolvedAddonManifest, int, string) {
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL.String(), nil)
 	request.Header.Set("Accept", "application/json")
 	response, err := h.client.Do(request)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "De addonmanifest kon niet worden opgehaald.")
-		return
+		return resolvedAddonManifest{}, http.StatusBadGateway, "De addonmanifest kon niet worden opgehaald."
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		writeError(w, http.StatusBadGateway, fmt.Sprintf("De addon gaf HTTP-status %d.", response.StatusCode))
-		return
+		return resolvedAddonManifest{}, http.StatusBadGateway, fmt.Sprintf("De addon gaf HTTP-status %d.", response.StatusCode)
 	}
 	var manifest addonManifest
 	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&manifest); err != nil {
-		writeError(w, http.StatusBadGateway, "De addonmanifest is geen geldige JSON.")
-		return
+		return resolvedAddonManifest{}, http.StatusBadGateway, "De addonmanifest is geen geldige JSON."
 	}
 	manifest.ID = strings.TrimSpace(manifest.ID)
 	manifest.Name = strings.TrimSpace(manifest.Name)
 	resources := resourceNames(manifest.Resources)
 	if manifest.ID == "" || manifest.Name == "" || len(resources) == 0 {
-		writeError(w, http.StatusBadRequest, "De manifest moet een id, naam en ondersteunde resource bevatten.")
-		return
+		return resolvedAddonManifest{}, http.StatusBadRequest, "De manifest moet een id, naam en ondersteunde resource bevatten."
 	}
 	base := *manifestURL
 	base.Path = strings.TrimSuffix(base.Path, "/manifest.json")
@@ -449,10 +451,37 @@ func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
 	if manifest.BehaviorHints.Configurable || manifest.BehaviorHints.ConfigurationRequired {
 		configureURL = baseURL + "/configure"
 	}
-	addon := Addon{
+	return resolvedAddonManifest{
 		ID: manifest.ID, Name: manifest.Name, Description: strings.TrimSpace(manifest.Description),
-		Version: strings.TrimSpace(manifest.Version), ManifestURL: manifestURL.String(),
-		BaseURL: baseURL, ConfigureURL: configureURL, Resources: resources, Catalogs: catalogs,
+		Version: strings.TrimSpace(manifest.Version), BaseURL: baseURL, ConfigureURL: configureURL,
+		Resources: resources, Catalogs: catalogs,
+	}, 0, ""
+}
+
+func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		ManifestURL string `json:"manifestURL"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, "Ongeldige aanvraag.")
+		return
+	}
+	manifestURL, err := validateEndpoint(input.ManifestURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	resolved, status, message := h.resolveAddonManifest(r.Context(), manifestURL)
+	if status != 0 {
+		writeError(w, status, message)
+		return
+	}
+	addon := Addon{
+		ID: resolved.ID, Name: resolved.Name, Description: resolved.Description,
+		Version: resolved.Version, ManifestURL: manifestURL.String(),
+		BaseURL: resolved.BaseURL, ConfigureURL: resolved.ConfigureURL,
+		Resources: resolved.Resources, Catalogs: resolved.Catalogs,
 		Enabled: true, AddedAt: time.Now().UTC(), Reachable: true,
 	}
 	if err := h.store.PutAddon(addon); err != nil {
@@ -460,6 +489,51 @@ func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, addon)
+}
+
+// refreshAddon re-fetches an already-registered addon's manifest.json and
+// updates its stored name/description/version/resources/catalogs in place.
+// Unlike addAddon this doesn't move the addon in the list or touch its
+// enabled state or health history — it exists because the hub otherwise
+// only ever reads an addon's manifest once, at the moment it's added, so an
+// addon that gains a capability later (e.g. adding "stream" support after
+// being registered as catalog/meta-only) is silently never picked up until
+// someone removes and re-adds it. This lets that happen without losing the
+// addon's position or its enabled/disabled state.
+func (h *Hub) refreshAddon(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	existing, ok := h.store.FindAddon(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "Addon niet gevonden.")
+		return
+	}
+	manifestURL, err := validateEndpoint(existing.ManifestURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	resolved, status, message := h.resolveAddonManifest(r.Context(), manifestURL)
+	if status != 0 {
+		writeError(w, status, message)
+		return
+	}
+	if resolved.ID != existing.ID {
+		writeError(w, http.StatusConflict, "De manifest-id van deze addon is veranderd; verwijder 'm en voeg opnieuw toe.")
+		return
+	}
+	updated := existing
+	updated.Name = resolved.Name
+	updated.Description = resolved.Description
+	updated.Version = resolved.Version
+	updated.BaseURL = resolved.BaseURL
+	updated.ConfigureURL = resolved.ConfigureURL
+	updated.Resources = resolved.Resources
+	updated.Catalogs = resolved.Catalogs
+	if err := h.store.PutAddon(updated); err != nil {
+		writeError(w, http.StatusInternalServerError, "De addon kon niet worden opgeslagen.")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (h *Hub) patchAddon(w http.ResponseWriter, r *http.Request) {
