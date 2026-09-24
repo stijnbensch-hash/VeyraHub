@@ -614,6 +614,28 @@ func (s *Store) AddonsForUser(userID string) []Addon {
 	return append([]Addon{}, s.state.UserAddons[index].Addons...)
 }
 
+// FindAddonForUser returns a copy of this user's addon with this id, for
+// callers that need its current stored fields (e.g. ManifestURL) before
+// recomputing them — such as a manifest refresh, which must know where to
+// re-fetch from.
+func (s *Store) FindAddonForUser(userID, id string) (Addon, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	index := s.userAddonIndexLocked(userID)
+	if index < 0 {
+		return Addon{}, false
+	}
+
+	for _, addon := range s.state.UserAddons[index].Addons {
+		if addon.ID == id {
+			return addon, true
+		}
+	}
+
+	return Addon{}, false
+}
+
 func (s *Store) PutAddonForUser(userID string, addon Addon) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
