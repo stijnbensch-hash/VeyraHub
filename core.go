@@ -7,13 +7,15 @@ import (
 )
 
 // isMediaType reports whether value is a media type the hub understands.
-// "sports" is a media type like "movie"/"series", not a separate addon
-// resource: a sports addon is just a catalog/meta/stream/subtitle provider
-// whose catalogs declare type "sports", so it flows through exactly the
-// same generic, resource-based capability system already used for movies
-// and series — nothing addon-facing is hardcoded to "sports" specifically.
+// "sports" and "tv" are media types like "movie"/"series", not a separate
+// addon resource: a sports/live-TV addon is just a catalog/meta/stream/
+// subtitle provider whose catalogs declare type "sports" or the
+// Stremio-standard "tv" (used by live-TV/live-sports addons such as Nuvio
+// Live Sports), so both flow through exactly the same generic,
+// resource-based capability system already used for movies and series —
+// nothing addon-facing is hardcoded to either type specifically.
 func isMediaType(value string) bool {
-	return value == "movie" || value == "series" || value == "sports"
+	return value == "movie" || value == "series" || value == "sports" || value == "tv"
 }
 
 // MediaCatalog is the neutral Hub representation of an addon catalog.

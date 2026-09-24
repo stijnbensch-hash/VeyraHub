@@ -139,7 +139,7 @@ func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
 			switch catalog.Type {
 			case "series":
 				collectionType = "tvshows"
-			case "sports":
+			case "sports", "tv":
 				collectionType = "livetv"
 			}
 			items = append(items, map[string]any{
@@ -154,7 +154,7 @@ func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
 		switch collection.MediaType {
 		case "series":
 			collectionType = "tvshows"
-		case "sports":
+		case "sports", "tv":
 			collectionType = "livetv"
 		}
 		items = append(items, map[string]any{
