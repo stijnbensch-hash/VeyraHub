@@ -12,3 +12,50 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+
+  serioussportsync:
+    container_name: serioussportsync
+    image: ghcr.io/monkfish1337/serioussportsync:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Defaults — env_file overrides these. Listed here so the schema is
+      # discoverable without opening .env.example.
+      PORT: "7000"
+      ADDON_TYPE: "${ADDON_TYPE:-movie}"
+      TSDB_API_KEY: "${TSDB_API_KEY:-123}"
+      TSDB_SEASONS: "${TSDB_SEASONS:-auto}"
+      REFRESH_INTERVAL_HOURS: "${REFRESH_INTERVAL_HOURS:-6}"
+      # Content discovery. The companion can combine Prowlarr/Zilean/etc;
+      # a direct Prowlarr connection can also be saved in the admin panel.
+      COMPANION_URL: "${COMPANION_URL:-}"
+      COMPANION_AUTH_TOKEN: "${COMPANION_AUTH_TOKEN:-}"
+      # Optional; may instead be saved from Admin after first sign-in.
+      API_FOOTBALL_API_KEY: "${API_FOOTBALL_API_KEY:-}"
+      # Accounts
+      SESSION_SECRET: "${SSS_SESSION_SECRET:?Set SSS_SESSION_SECRET in .env}"
+      ADMIN_USER: "${SSS_ADMIN_USER:-}"
+    volumes:
+      - serioussportsync_data:/app/data
+    mem_limit: ${SSS_MEM_LIMIT:-1g}
+    cpus: ${SSS_CPUS:-2}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # Alleen lokaal bereikbaar; VeyraHub haalt het manifest op via
+      # 127.0.0.1, niet publiek blootgesteld.
+      - "${SSS_BIND_ADDRESS:-127.0.0.1}:${SSS_HOST_PORT:-7000}:7000"
+
+volumes:
+  serioussportsync_data:
