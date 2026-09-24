@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -128,6 +127,12 @@ func (h *Hub) Routes() http.Handler {
 	h.registerVeyraSyncRoutes(mux)
 	h.registerNativeRoutes(mux)
 	h.registerJellyfinRoutes(mux)
+	h.registerFilterRoutes(mux)
+	h.registerCollectionRoutes(mux)
+	h.registerProfileRoutes(mux)
+	h.registerNotificationRoutes(mux)
+	h.registerSourceRoutes(mux)
+	h.registerRequestRoutes(mux)
 	return securityHeaders(mux)
 }
 
@@ -186,7 +191,13 @@ func (h *Hub) recordAddonHealth(id string, ok bool, message string) {
 	if !found {
 		return
 	}
-	h.store.RecordAddonHealthForUser(adminID, id, ok, message)
+	transition, addonName := h.store.RecordAddonHealthForUser(adminID, id, ok, message)
+	switch transition {
+	case addonHealthBecameUnreachable:
+		h.store.CreateNotification(adminID, "Addon onbereikbaar", addonName+" is niet meer bereikbaar.")
+	case addonHealthBecameReachable:
+		h.store.CreateNotification(adminID, "Addon weer bereikbaar", addonName+" is weer bereikbaar.")
+	}
 }
 
 func (h *Hub) index(w http.ResponseWriter, r *http.Request) {
@@ -585,11 +596,12 @@ func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubS
 		values = append(values, result.streams...)
 	}
 	values = deduplicateStreams(values)
+	values = dedupeStreamMirrors(values)
 	rank := map[string]int{}
 	for index, addon := range addons {
 		rank[addon.ID] = index
 	}
-	sort.SliceStable(values, func(i, j int) bool { return rank[values[i].AddonID] < rank[values[j].AddonID] })
+	values = rankStreams(values, rank)
 	return values
 }
 

@@ -47,6 +47,7 @@ type MediaItem struct {
 	Poster      string       `json:"poster,omitempty"`
 	Backdrop    string       `json:"backdrop,omitempty"`
 	Year        int          `json:"year,omitempty"`
+	Genres      []string     `json:"genres,omitempty"`
 	Videos      []MediaVideo `json:"videos,omitempty"`
 }
 
@@ -60,6 +61,7 @@ func mediaItemFromMeta(addonID string, meta stremioMeta) MediaItem {
 		Poster:      meta.Poster,
 		Backdrop:    meta.Background,
 		Year:        metaYear(meta),
+		Genres:      meta.Genres,
 	}
 
 	if meta.Type == "series" {
@@ -129,6 +131,7 @@ func (h *Hub) mediaCatalogItems(
 	ctx context.Context,
 	addonID, mediaType, catalogID, search string,
 	skip int,
+	filter ContentFilter,
 ) ([]MediaItem, error) {
 	addon, catalog, ok := h.catalogByID(addonID, catalogID, mediaType)
 	if !ok {
@@ -140,7 +143,7 @@ func (h *Hub) mediaCatalogItems(
 		return nil, err
 	}
 
-	return mediaItemsFromMetas(addon.ID, metas), nil
+	return mediaItemsFromMetas(addon.ID, filterMetas(metas, filter)), nil
 }
 
 func (h *Hub) mediaMetadata(
@@ -162,7 +165,7 @@ func (h *Hub) mediaMetadata(
 	return mediaItemFromMeta(sourceAddonID, meta), nil
 }
 
-func (h *Hub) mediaSearch(ctx context.Context, query string) []MediaItem {
+func (h *Hub) mediaSearch(ctx context.Context, query string, filter ContentFilter) []MediaItem {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return []MediaItem{}
@@ -186,7 +189,7 @@ func (h *Hub) mediaSearch(ctx context.Context, query string) []MediaItem {
 				continue
 			}
 
-			for _, item := range mediaItemsFromMetas(addon.ID, metas) {
+			for _, item := range mediaItemsFromMetas(addon.ID, filterMetas(metas, filter)) {
 				// IDs such as IMDb IDs are often shared by multiple addons.
 				// Present one neutral media item rather than duplicates from
 				// every catalog provider.

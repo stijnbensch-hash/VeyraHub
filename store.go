@@ -109,6 +109,17 @@ type State struct {
 	Users      []User          `json:"users,omitempty"`
 	Sessions   []Session       `json:"sessions,omitempty"`
 	VeyraSync  []VeyraUserSync `json:"veyraSync,omitempty"`
+
+	// Feature stores added alongside the original data model. Each follows
+	// the same per-user-slice-in-State shape as UserAddons/VeyraSync above.
+	ContentFilters   []ContentFilter   `json:"contentFilters,omitempty"`
+	SmartCollections []SmartCollection `json:"smartCollections,omitempty"`
+	Profiles         []Profile         `json:"profiles,omitempty"`
+	ProfileUsage     []ProfileUsage    `json:"profileUsage,omitempty"`
+	Notifications    []Notification    `json:"notifications,omitempty"`
+	PushTokens       []PushToken       `json:"pushTokens,omitempty"`
+	Sources          []Source          `json:"sources,omitempty"`
+	Requests         []MediaRequest    `json:"requests,omitempty"`
 }
 
 type Store struct {
@@ -198,6 +209,14 @@ func (s *Store) Snapshot() State {
 	copyState.Users = append([]User{}, s.state.Users...)
 	copyState.Sessions = append([]Session{}, s.state.Sessions...)
 	copyState.VeyraSync = append([]VeyraUserSync{}, s.state.VeyraSync...)
+	copyState.ContentFilters = append([]ContentFilter{}, s.state.ContentFilters...)
+	copyState.SmartCollections = append([]SmartCollection{}, s.state.SmartCollections...)
+	copyState.Profiles = append([]Profile{}, s.state.Profiles...)
+	copyState.ProfileUsage = append([]ProfileUsage{}, s.state.ProfileUsage...)
+	copyState.Notifications = append([]Notification{}, s.state.Notifications...)
+	copyState.PushTokens = append([]PushToken{}, s.state.PushTokens...)
+	copyState.Sources = append([]Source{}, s.state.Sources...)
+	copyState.Requests = append([]MediaRequest{}, s.state.Requests...)
 
 	return copyState
 }
@@ -307,6 +326,56 @@ func (s *Store) DeleteUser(id string) error {
 	}
 	s.state.VeyraSync = syncKept
 
+	filtersKept := s.state.ContentFilters[:0]
+	for _, filter := range s.state.ContentFilters {
+		if filter.UserID != id {
+			filtersKept = append(filtersKept, filter)
+		}
+	}
+	s.state.ContentFilters = filtersKept
+
+	var keptProfileIDs = map[string]bool{}
+	profilesKept := s.state.Profiles[:0]
+	for _, profile := range s.state.Profiles {
+		if profile.UserID != id {
+			profilesKept = append(profilesKept, profile)
+			keptProfileIDs[profile.ID] = true
+		}
+	}
+	s.state.Profiles = profilesKept
+
+	usageKept := s.state.ProfileUsage[:0]
+	for _, usage := range s.state.ProfileUsage {
+		if keptProfileIDs[usage.ProfileID] {
+			usageKept = append(usageKept, usage)
+		}
+	}
+	s.state.ProfileUsage = usageKept
+
+	notificationsKept := s.state.Notifications[:0]
+	for _, notification := range s.state.Notifications {
+		if notification.UserID != id {
+			notificationsKept = append(notificationsKept, notification)
+		}
+	}
+	s.state.Notifications = notificationsKept
+
+	tokensKept := s.state.PushTokens[:0]
+	for _, token := range s.state.PushTokens {
+		if token.UserID != id {
+			tokensKept = append(tokensKept, token)
+		}
+	}
+	s.state.PushTokens = tokensKept
+
+	requestsKept := s.state.Requests[:0]
+	for _, request := range s.state.Requests {
+		if request.UserID != id {
+			requestsKept = append(requestsKept, request)
+		}
+	}
+	s.state.Requests = requestsKept
+
 	return s.persistLocked()
 }
 
@@ -348,6 +417,17 @@ func (s *Store) Authenticate(username, password string) (User, bool) {
 // CreateSession issues a fresh access/refresh token pair for a device and
 // persists only their hashes.
 func (s *Store) CreateSession(userID, deviceID, deviceName string) (Session, string, string, error) {
+	return s.createSession(userID, deviceID, deviceName, false)
+}
+
+// Jellyfin clients keep only AccessToken, so they cannot rotate a refresh token.
+// Keep that access token valid until the session is revoked or user disabled.
+func (s *Store) CreateMediaSession(userID, deviceID, deviceName string) (Session, string, error) {
+	session, accessToken, _, err := s.createSession(userID, deviceID, deviceName, true)
+	return session, accessToken, err
+}
+
+func (s *Store) createSession(userID, deviceID, deviceName string, media bool) (Session, string, string, error) {
 	if deviceID == "" {
 		deviceID = randomID()
 	}
@@ -358,6 +438,10 @@ func (s *Store) CreateSession(userID, deviceID, deviceName string) (Session, str
 		ID: randomID(), UserID: userID, DeviceID: deviceID, DeviceName: deviceName,
 		AccessTokenHash: tokenHash(accessToken), RefreshTokenHash: tokenHash(refreshToken),
 		CreatedAt: now, AccessExpiresAt: now.Add(accessTokenTTL), RefreshExpiresAt: now.Add(refreshTokenTTL),
+	}
+	if media {
+		session.AccessExpiresAt = time.Time{}
+		session.RefreshExpiresAt = time.Time{}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -383,7 +467,7 @@ func (s *Store) SessionByAccessToken(token string) (Session, User, bool) {
 		if !secureHashEqual(session.AccessTokenHash, wantedHash) {
 			continue
 		}
-		if session.RevokedAt != nil || now.After(session.AccessExpiresAt) {
+		if session.RevokedAt != nil || (!session.AccessExpiresAt.IsZero() && now.After(session.AccessExpiresAt)) {
 			return Session{}, User{}, false
 		}
 		user, ok := s.userByID(session.UserID)
@@ -567,7 +651,22 @@ func (s *Store) SetAddonEnabledForUser(userID, id string, enabled bool) error {
 	return os.ErrNotExist
 }
 
-func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message string) {
+// addonHealthTransition describes whether RecordAddonHealthForUser's update
+// crossed a reachable/unreachable boundary, for the caller to decide
+// whether it's worth a notification.
+type addonHealthTransition int
+
+const (
+	addonHealthUnchanged addonHealthTransition = iota
+	addonHealthBecameReachable
+	addonHealthBecameUnreachable
+)
+
+// RecordAddonHealthForUser updates an addon's observed reachability and
+// reports whether this call crossed a reachable/unreachable boundary (never
+// reported on the very first observation, which is just the addon settling
+// in rather than a real transition), along with the addon's display name.
+func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message string) (addonHealthTransition, string) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -575,7 +674,7 @@ func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message str
 
 	index := s.userAddonIndexLocked(userID)
 	if index < 0 {
-		return
+		return addonHealthUnchanged, ""
 	}
 
 	for i := range s.state.UserAddons[index].Addons {
@@ -583,6 +682,9 @@ func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message str
 		if addon.ID != id {
 			continue
 		}
+
+		hadPriorObservation := addon.LastSuccessAt != nil || addon.LastErrorAt != nil
+		wasReachable := addon.Reachable
 
 		addon.Reachable = ok
 
@@ -594,8 +696,17 @@ func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message str
 		}
 
 		_ = s.persistLocked()
-		return
+
+		if !hadPriorObservation || wasReachable == ok {
+			return addonHealthUnchanged, addon.Name
+		}
+		if ok {
+			return addonHealthBecameReachable, addon.Name
+		}
+		return addonHealthBecameUnreachable, addon.Name
 	}
+
+	return addonHealthUnchanged, ""
 }
 
 func (s *Store) DeleteAddonForUser(userID, id string) error {

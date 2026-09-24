@@ -96,6 +96,7 @@ func (h *Hub) nativeCatalog(w http.ResponseWriter, r *http.Request) {
 		skip = parsed
 	}
 
+	user, _ := userFromContext(r)
 	items, err := h.mediaCatalogItems(
 		r.Context(),
 		r.PathValue("addonID"),
@@ -103,6 +104,7 @@ func (h *Hub) nativeCatalog(w http.ResponseWriter, r *http.Request) {
 		r.PathValue("catalogID"),
 		strings.TrimSpace(r.URL.Query().Get("search")),
 		skip,
+		h.store.ContentFilterForUser(user.ID),
 	)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "Catalogus niet gevonden of tijdelijk niet beschikbaar.")
@@ -123,7 +125,8 @@ func (h *Hub) nativeSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items := h.mediaSearch(r.Context(), query)
+	user, _ := userFromContext(r)
+	items := h.mediaSearch(r.Context(), query, h.store.ContentFilterForUser(user.ID))
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"query": query,
@@ -166,6 +169,10 @@ func (h *Hub) nativeStreams(w http.ResponseWriter, r *http.Request) {
 
 	if !isMediaType(mediaType) || id == "" {
 		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
+		return
+	}
+	if h.profileLimitExceeded(r) {
+		writeError(w, http.StatusForbidden, "De dagelijkse kijklimiet van dit profiel is bereikt.")
 		return
 	}
 

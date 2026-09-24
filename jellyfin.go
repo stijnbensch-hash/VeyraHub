@@ -24,6 +24,12 @@ type hubItemID struct {
 	SeriesID   string `json:"si,omitempty"`
 	Season     int    `json:"s,omitempty"`
 	Episode    int    `json:"e,omitempty"`
+
+	// Path is a file's path relative to its Source's root/base, used by
+	// Kind == "localItem" ("localSource" library, AddonID field reused to
+	// carry the Source id — same neutral hubItemID shape, no new library
+	// concept needed for it).
+	Path string `json:"pa,omitempty"`
 }
 
 func (h *Hub) registerJellyfinRoutes(mux *http.ServeMux) {
@@ -64,7 +70,7 @@ func (h *Hub) jellyfinAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fields := embyAuthFields(r.Header.Get("X-Emby-Authorization"))
-	session, accessToken, _, err := h.store.CreateSession(user.ID, fields["DeviceId"], fields["Device"])
+	_, accessToken, err := h.store.CreateMediaSession(user.ID, fields["DeviceId"], fields["Device"])
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Aanmelden is mislukt.")
 		return
@@ -74,18 +80,19 @@ func (h *Hub) jellyfinAuthenticate(w http.ResponseWriter, r *http.Request) {
 		"User":        map[string]any{"Id": user.ID, "Name": user.Username},
 		"AccessToken": accessToken, "ServerId": state.NodeID,
 	})
-	_ = session
 }
 
 func (h *Hub) jellyfinProtected(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := jellyfinToken(r)
-		_, user, ok := h.store.SessionByAccessToken(token)
+		session, user, ok := h.store.SessionByAccessToken(token)
 		if !ok || (r.PathValue("userID") != "" && r.PathValue("userID") != user.ID) {
 			writeError(w, http.StatusUnauthorized, "Een geldige mediaserversessie is vereist.")
 			return
 		}
-		next(w, r)
+		ctx := context.WithValue(r.Context(), ctxUserKey, user)
+		ctx = context.WithValue(ctx, ctxSessionKey, session)
+		next(w, r.WithContext(ctx))
 	}
 }
 
@@ -127,6 +134,28 @@ func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
+	for _, collection := range h.store.SmartCollections() {
+		id := encodeHubID(hubItemID{Kind: "smartCollection", CatalogID: collection.ID, MediaType: collection.MediaType, Name: collection.Name})
+		collectionType := "movies"
+		switch collection.MediaType {
+		case "series":
+			collectionType = "tvshows"
+		case "sports":
+			collectionType = "livetv"
+		}
+		items = append(items, map[string]any{
+			"Id": id, "Name": collection.Name, "Type": "CollectionFolder", "CollectionType": collectionType,
+		})
+	}
+	for _, source := range h.store.Sources() {
+		if !source.Enabled {
+			continue
+		}
+		id := encodeHubID(hubItemID{Kind: "localSource", AddonID: source.ID, Name: source.Name})
+		items = append(items, map[string]any{
+			"Id": id, "Name": source.Name, "Type": "CollectionFolder", "CollectionType": "movies",
+		})
+	}
 	if items == nil {
 		items = []map[string]any{}
 	}
@@ -138,6 +167,8 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(r.URL.Query().Get("SearchTerm"))
 	limit := queryInt(r, "Limit", 100)
 	var values []map[string]any
+	user, _ := userFromContext(r)
+	filter := h.store.ContentFilterForUser(user.ID)
 
 	if parentID != "" {
 		parent, err := decodeHubID(parentID)
@@ -150,8 +181,12 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 			addon, catalog, ok := h.catalogByID(parent.AddonID, parent.CatalogID, parent.MediaType)
 			if ok {
 				metas, _ := h.fetchCatalog(r.Context(), addon, catalog, search, queryInt(r, "StartIndex", 0))
-				values = h.jellyfinItemsFromMetas(addon.ID, metas)
+				values = h.jellyfinItemsFromMetas(addon.ID, filterMetas(metas, filter))
 			}
+		case "smartCollection":
+			values = h.jellyfinSmartCollectionItems(r.Context(), parent.CatalogID, filter)
+		case "localSource":
+			values = h.jellyfinSourceItems(r.Context(), parent.AddonID)
 		case "item":
 			if parent.MediaType == "series" {
 				meta, _ := h.fetchMeta(r.Context(), parent.AddonID, "series", parent.MediaID)
@@ -159,7 +194,7 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else if search != "" {
-		values = h.searchCatalogs(r.Context(), search)
+		values = h.searchCatalogs(r.Context(), search, filter)
 	}
 
 	values = filterJellyfinTypes(values, r.URL.Query().Get("IncludeItemTypes"))
@@ -174,6 +209,8 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 
 func (h *Hub) jellyfinLatest(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "Limit", 20)
+	user, _ := userFromContext(r)
+	filter := h.store.ContentFilterForUser(user.ID)
 	var values []map[string]any
 	for _, addon := range h.addonCatalog() {
 		if !addon.Enabled {
@@ -182,7 +219,7 @@ func (h *Hub) jellyfinLatest(w http.ResponseWriter, r *http.Request) {
 		for _, catalog := range addon.Catalogs {
 			metas, err := h.fetchCatalog(r.Context(), addon, catalog, "", 0)
 			if err == nil {
-				values = append(values, h.jellyfinItemsFromMetas(addon.ID, metas)...)
+				values = append(values, h.jellyfinItemsFromMetas(addon.ID, filterMetas(metas, filter))...)
 			}
 			if len(values) >= limit {
 				break
@@ -221,8 +258,21 @@ func (h *Hub) jellyfinImage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Hub) jellyfinPlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	item, err := decodeHubID(r.PathValue("itemID"))
-	if err != nil || item.MediaID == "" {
+	if err != nil || (item.MediaID == "" && item.Kind != "localItem") {
 		http.NotFound(w, r)
+		return
+	}
+	if h.profileLimitExceeded(r) {
+		writeError(w, http.StatusForbidden, "De dagelijkse kijklimiet van dit profiel is bereikt.")
+		return
+	}
+
+	if item.Kind == "localItem" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"MediaSources":  []map[string]any{h.localItemMediaSource(r, item)},
+			"PlaySessionId": "",
+			"ErrorCode":     nil,
+		})
 		return
 	}
 
@@ -291,8 +341,17 @@ func (h *Hub) jellyfinPlaybackInfo(w http.ResponseWriter, r *http.Request) {
 
 func (h *Hub) jellyfinStream(w http.ResponseWriter, r *http.Request) {
 	item, err := decodeHubID(r.PathValue("itemID"))
-	if err != nil || item.MediaID == "" {
+	if err != nil || (item.MediaID == "" && item.Kind != "localItem") {
 		http.NotFound(w, r)
+		return
+	}
+	if h.profileLimitExceeded(r) {
+		writeError(w, http.StatusForbidden, "De dagelijkse kijklimiet van dit profiel is bereikt.")
+		return
+	}
+	if item.Kind == "localItem" {
+		source := h.localItemMediaSource(r, item)
+		http.Redirect(w, r, source["Path"].(string), http.StatusTemporaryRedirect)
 		return
 	}
 	streams := h.aggregateStreams(r.Context(), item.MediaType, item.MediaID)
@@ -303,7 +362,7 @@ func (h *Hub) jellyfinStream(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, streams[0].URL, http.StatusTemporaryRedirect)
 }
 
-func (h *Hub) searchCatalogs(ctx context.Context, query string) []map[string]any {
+func (h *Hub) searchCatalogs(ctx context.Context, query string, filter ContentFilter) []map[string]any {
 	var result []map[string]any
 	for _, addon := range h.addonCatalog() {
 		if !addon.Enabled {
@@ -315,7 +374,7 @@ func (h *Hub) searchCatalogs(ctx context.Context, query string) []map[string]any
 			}
 			metas, err := h.fetchCatalog(ctx, addon, catalog, query, 0)
 			if err == nil {
-				result = append(result, h.jellyfinItemsFromMetas(addon.ID, metas)...)
+				result = append(result, h.jellyfinItemsFromMetas(addon.ID, filterMetas(metas, filter))...)
 			}
 		}
 	}

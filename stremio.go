@@ -21,6 +21,7 @@ type stremioMeta struct {
 	Background  string          `json:"background"`
 	ReleaseInfo string          `json:"releaseInfo"`
 	Year        json.RawMessage `json:"year"`
+	Genres      []string        `json:"genres"`
 	Videos      []struct {
 		ID        string `json:"id"`
 		Title     string `json:"title"`
