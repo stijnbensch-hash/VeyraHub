@@ -40,10 +40,12 @@ Gebruik buiten het eigen netwerk HTTPS via een reverse proxy of privénetwerk.
 - Elk account (beheer of kijker) heeft een eigen gebruikersnaam en wachtwoord.
   Wachtwoorden worden gezouten en gehasht opgeslagen (PBKDF2-HMAC-SHA256,
   210.000 iteraties); niemand hoeft ooit handmatig een API-sleutel te beheren.
-- Inloggen (`POST /v1/auth/login`, of `Users/AuthenticateByName` voor
-  Jellyfin-clients zoals Veyra) levert een kortlevende toegangstoken (12u) en
-  een refreshtoken (30 dagen) op, gebonden aan een apparaat-id. Alleen de
-  hashes van beide tokens komen in `hub.json` terecht.
+- Inloggen via `POST /v1/auth/login` levert een toegangstoken (12u) en een
+  refreshtoken (30 dagen) op, gebonden aan een apparaat-id. Jellyfin-clients
+  zoals Veyra bewaren geen refreshtoken; `Users/AuthenticateByName` geeft
+  daarom een toegangstoken die geldig blijft totdat de sessie wordt
+  ingetrokken of het account wordt uitgeschakeld. Alleen tokenhashes komen
+  in `hub.json` terecht.
 - `POST /v1/auth/refresh` wisselt een geldig refreshtoken in voor een nieuw
   paar zonder opnieuw in te loggen; `POST /v1/auth/logout` trekt de huidige
   sessie in.

@@ -223,6 +223,17 @@ func TestAddonAndStreamAggregation(t *testing.T) {
 	if jellyfinAuth.AccessToken == "" {
 		t.Fatal("expected a Jellyfin session access token")
 	}
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/veyra/v1/livetv", nil)
+	request.Header.Set("Authorization", "Bearer "+jellyfinAuth.AccessToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("Jellyfin token must authorize Veyra sync: %v status=%v", err, response.StatusCode)
+	}
+	response.Body.Close()
+	mediaSession, _, ok := store.SessionByAccessToken(jellyfinAuth.AccessToken)
+	if !ok || !mediaSession.AccessExpiresAt.IsZero() {
+		t.Fatal("Jellyfin session must remain valid until revoked")
+	}
 
 	request, _ = http.NewRequest(http.MethodGet, server.URL+"/Users/"+jellyfinAuth.User.ID+"/Views", nil)
 	request.Header.Set("X-Emby-Token", jellyfinAuth.AccessToken)
