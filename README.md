@@ -94,6 +94,66 @@ maar zijn in deze versie niet allemaal gegarandeerd.
   beheerpagina. Dit is puur telemetrie; enabled/disabled blijft een losse,
   door de beheerder bepaalde schakelaar.
 
+## VeyraHub Recorder (opnames)
+
+Live-tv opnemen loopt via een eigen, optioneel proces naast de hub —
+`veyrahub-recorder`, in de `recorder/`-map — niet via de hub zelf en niet via
+Strand Recorder. Het is uitgeschakeld totdat je het opzet.
+
+1. **Bouw en installeer de recorder op de VPS** (Go 1.23+):
+
+   ```sh
+   cd recorder
+   go build -o veyrahub-recorder .
+   sudo install -m 755 veyrahub-recorder /opt/veyrahub-recorder/veyrahub-recorder
+   ```
+
+2. **FFmpeg is verplicht** (opnemen zonder hercoderen):
+
+   ```sh
+   sudo apt install -y ffmpeg
+   ```
+
+3. **Comskip is optioneel** — alleen nodig voor reclamedetectie
+   (`recorder/README.md` beschrijft waarom en hoe de opname er zonder eruit
+   ziet). Installeer het en zet `recorder/comskip.ini` op
+   `/etc/veyrahub-recorder/comskip.ini`; laat je dit weg, dan werken opnemen
+   en afspelen gewoon door, alleen zonder reclame-overslaan in Veyra.
+
+4. **Zet de recorder als systemd-service.** `recorder/veyrahub-recorder.service`
+   is kant-en-klaar (eigen gebruiker, alleen-lezen bestandssysteem op de rest
+   van de VPS, `ReadWritePaths` beperkt tot zijn eigen datamap):
+
+   ```sh
+   sudo useradd --system --home /var/lib/veyrahub-recorder --shell /usr/sbin/nologin veyrarecorder
+   sudo cp recorder/veyrahub-recorder.service /etc/systemd/system/
+   sudo tee /etc/veyrahub-recorder.env <<'EOF'
+   VEYRA_RECORDER_TOKEN=een-lang-willekeurig-intern-token
+   EOF
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now veyrahub-recorder
+   ```
+
+   De recorder luistert standaard alleen op `127.0.0.1:8480` — hij is nooit
+   rechtstreeks vanaf buiten de VPS bereikbaar.
+
+5. **Vertel de hub waar de recorder draait.** Zet in de hub's `.env`
+   (of `compose.yaml`-omgeving) hetzelfde token als hierboven:
+
+   ```text
+   VEYRA_HUB_RECORDER_URL=http://127.0.0.1:8480
+   VEYRA_HUB_RECORDER_TOKEN=een-lang-willekeurig-intern-token
+   ```
+
+   en herstart de hub. Zonder deze twee variabelen blijft `/v1/recorder/*`
+   gewoon bestaan maar antwoordt het met "VeyraHub Recorder is niet
+   geconfigureerd." — de rest van de hub blijft onaangetast werken.
+
+6. Klaar: de beheerpagina krijgt een "Recorder"-tabblad, en in Veyra's
+   programmagids verschijnt een opnameknop bij elk nog niet uitgezonden
+   programma (zie `recorder/README.md` voor hoe opslag, privacy en Comskip
+   precies werken).
+
 ## API
 
 - `GET /health` — publieke livenesscontrole zonder configuratiedetails.
@@ -117,6 +177,15 @@ maar zijn in deze versie niet allemaal gegarandeerd.
   `GET /api/v1/items/{movie|series|sports}/{id}/subtitles` — de native API
   van de hub: neemt een ruwe (bijv. IMDb-stijl) id direct aan, zonder eerst
   een catalogus te doorzoeken.
+- `GET /v1/recorder/status`, `GET|POST /v1/recorder/recordings`,
+  `DELETE /v1/recorder/recordings/{id}`,
+  `POST /v1/recorder/recordings/{id}/stop`,
+  `GET /v1/recorder/recordings/{id}/file` — VeyraHub Recorder, alleen actief
+  wanneer `VEYRA_HUB_RECORDER_URL`/`VEYRA_HUB_RECORDER_TOKEN` zijn gezet (zie
+  hierboven). De `/file`-route accepteert het toegangstoken ook als
+  `?access_token=`-querywaarde, voor spelers die geen eigen headers kunnen
+  meesturen; elke andere route vereist zoals gebruikelijk de
+  `Authorization`-header.
 
 Routes gemarkeerd *(beheer)* vereisen `Authorization: Bearer <accessToken>`
 van een ingelogd beheeraccount; de rest van de `/v1`-routes vereist alleen een

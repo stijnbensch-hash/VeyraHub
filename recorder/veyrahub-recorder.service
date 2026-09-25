@@ -1,0 +1,25 @@
+[Unit]
+Description=VeyraHub Recorder
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=veyrarecorder
+Group=veyrarecorder
+EnvironmentFile=/etc/veyrahub-recorder.env
+ExecStart=/opt/veyrahub-recorder/veyrahub-recorder
+Restart=on-failure
+RestartSec=5
+StateDirectory=veyrahub-recorder
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/veyrahub-recorder
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/veyrahub-recorder
+
+[Install]
+WantedBy=multi-user.target

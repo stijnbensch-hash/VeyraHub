@@ -7,6 +7,8 @@ services:
       VEYRA_HUB_USERNAME: "${VEYRA_HUB_USERNAME:-admin}"
       VEYRA_HUB_TOKEN: "${VEYRA_HUB_TOKEN:?set VEYRA_HUB_TOKEN in .env}"
       VEYRA_HUB_ADDRESS: "127.0.0.1:8787"
+      VEYRA_HUB_RECORDER_URL: "${VEYRA_HUB_RECORDER_URL:-}"
+      VEYRA_HUB_RECORDER_TOKEN: "${VEYRA_HUB_RECORDER_TOKEN:-}"
     volumes:
       - ./data:/data
     read_only: true
