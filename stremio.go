@@ -33,6 +33,11 @@ type stremioMeta struct {
 }
 
 func (h *Hub) fetchCatalog(ctx context.Context, addon Addon, catalog AddonCatalog, search string, skip int) ([]stremioMeta, error) {
+	cacheKey := addon.ID + "\x00" + catalog.Type + "\x00" + catalog.ID + "\x00" + search + "\x00" + strconv.Itoa(skip)
+	if cached, ok := h.catalogCache.get(cacheKey); ok {
+		return cached, nil
+	}
+
 	base, err := url.Parse(addon.BaseURL)
 	if err != nil {
 		return nil, err
@@ -68,10 +73,11 @@ func (h *Hub) fetchCatalog(ctx context.Context, addon Addon, catalog AddonCatalo
 	err = json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&payload)
 	if err != nil {
 		h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
-	} else {
-		h.recordAddonHealth(addon.ID, true, "")
+		return nil, err
 	}
-	return payload.Metas, err
+	h.recordAddonHealth(addon.ID, true, "")
+	h.catalogCache.set(cacheKey, payload.Metas)
+	return payload.Metas, nil
 }
 
 func (h *Hub) fetchMeta(ctx context.Context, preferredAddonID, mediaType, id string) (stremioMeta, error) {
