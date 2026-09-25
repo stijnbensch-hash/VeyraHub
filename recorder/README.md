@@ -30,6 +30,17 @@ de VPS: bouwen, FFmpeg/Comskip, de systemd-service en het koppelen aan de hub.
 | `VEYRA_RECORDER_DATA` | `/var/lib/veyrahub-recorder` | Map voor `recordings.json`. |
 | `VEYRA_RECORDER_RECORDINGS` | `/var/lib/veyrahub-recorder/files` | Map voor de opgenomen `.ts`-bestanden. |
 | `VEYRA_RECORDER_COMSKIP_INI` | `/etc/veyrahub-recorder/comskip.ini` | Comskip-configuratie; ontbreekt dit bestand, dan wordt reclamedetectie stilzwijgend overgeslagen. |
+| `VEYRA_RECORDER_RETENTION_DAYS` | `30` | Hoeveel dagen na het einde van de opname een voltooide opname bewaard blijft, voordat het bestand en de vermelding automatisch verwijderd worden. Zet op `0` om automatisch opruimen helemaal uit te schakelen. |
 
 FFmpeg en (optioneel) `comskip` worden via `PATH` gevonden — er is geen apart
 pad-instelling voor FFmpeg.
+
+## Automatisch opruimen (retentie)
+
+Elke opname die is afgerond (`status: completed`) en waarvan het geplande
+eindtijdstip meer dan `VEYRA_RECORDER_RETENTION_DAYS` dagen geleden is (standaard
+30), wordt automatisch verwijderd: het `.ts`-bestand, bijbehorende
+Comskip-bestanden en de vermelding in `recordings.json`. Dit gebeurt op
+dezelfde interne klok die ook opnames start en stopt (elke 2 seconden), dus
+er is geen aparte cron-taak nodig. Geplande of nog lopende opnames worden
+nooit op deze manier opgeruimd — alleen al voltooide opnames.

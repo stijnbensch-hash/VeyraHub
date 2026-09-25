@@ -77,9 +77,13 @@ type recorder struct {
 	comskip       string
 	comskipINI    string
 	scanning      bool
+	// retention is how long a completed recording is kept before it's
+	// automatically deleted (file and entry), measured from its scheduled
+	// end time. Zero disables automatic cleanup entirely.
+	retention time.Duration
 }
 
-func newRecorder(dataDir, recordingsDir, token, ffmpeg string) (*recorder, error) {
+func newRecorder(dataDir, recordingsDir, token, ffmpeg string, retention time.Duration) (*recorder, error) {
 	if token == "" {
 		return nil, errors.New("internal token is required")
 	}
@@ -93,7 +97,7 @@ func newRecorder(dataDir, recordingsDir, token, ffmpeg string) (*recorder, error
 	if _, err := os.Stat(comskipINI); err != nil {
 		comskip = ""
 	}
-	r := &recorder{jobs: map[string]*recording{}, cancel: map[string]context.CancelFunc{}, stopReason: map[string]string{}, dataDir: dataDir, recordingsDir: recordingsDir, token: token, ffmpeg: ffmpeg, comskip: comskip, comskipINI: comskipINI}
+	r := &recorder{jobs: map[string]*recording{}, cancel: map[string]context.CancelFunc{}, stopReason: map[string]string{}, dataDir: dataDir, recordingsDir: recordingsDir, token: token, ffmpeg: ffmpeg, comskip: comskip, comskipINI: comskipINI, retention: retention}
 	data, err := os.ReadFile(filepath.Join(dataDir, "recordings.json"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -374,7 +378,9 @@ func (r *recorder) run(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
-		r.tick()
+		for _, id := range r.tick() {
+			r.removeFiles(id)
+		}
 		select {
 		case <-ctx.Done():
 			r.mu.Lock()
@@ -388,7 +394,11 @@ func (r *recorder) run(ctx context.Context) {
 	}
 }
 
-func (r *recorder) tick() {
+// tick advances scheduled/running recordings and, if retention is set,
+// removes completed recordings whose scheduled end time is older than the
+// retention window. It returns the ids of recordings it just removed, whose
+// files the caller should delete once the lock is released.
+func (r *recorder) tick() []string {
 	r.mu.Lock()
 	now := time.Now()
 	changed := false
@@ -435,12 +445,29 @@ func (r *recorder) tick() {
 			}
 		}
 	}
+	var expired []string
+	if r.retention > 0 {
+		cutoff := now.Add(-r.retention)
+		for id, job := range r.jobs {
+			if job.Status == "completed" && job.End.Before(cutoff) {
+				expired = append(expired, id)
+			}
+		}
+		for _, id := range expired {
+			delete(r.jobs, id)
+			changed = true
+		}
+	}
 	if changed {
 		if err := r.saveLocked(); err != nil {
 			slog.Error("recorder state save failed", "error", err)
 		}
 	}
 	r.mu.Unlock()
+	if len(expired) > 0 {
+		slog.Info("recorder retention: removed expired recordings", "count", len(expired), "retentionDays", int(r.retention/(24*time.Hour)))
+	}
+	return expired
 }
 
 func (r *recorder) capture(ctx context.Context, id, source string, remaining time.Duration) {
@@ -542,11 +569,17 @@ func main() {
 	token := os.Getenv("VEYRA_RECORDER_TOKEN")
 	dataDir := env("VEYRA_RECORDER_DATA", "/var/lib/veyrahub-recorder")
 	recordingsDir := env("VEYRA_RECORDER_RECORDINGS", "/var/lib/veyrahub-recorder/files")
+	retention := envDays("VEYRA_RECORDER_RETENTION_DAYS", 30)
 	ffmpeg, _ := exec.LookPath("ffmpeg")
-	r, err := newRecorder(dataDir, recordingsDir, token, ffmpeg)
+	r, err := newRecorder(dataDir, recordingsDir, token, ffmpeg, retention)
 	if err != nil {
 		slog.Error("recorder setup failed", "error", err)
 		os.Exit(1)
+	}
+	if retention > 0 {
+		slog.Info("recorder retention enabled", "days", int(retention/(24*time.Hour)))
+	} else {
+		slog.Info("recorder retention disabled (VEYRA_RECORDER_RETENTION_DAYS=0)")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -570,4 +603,20 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// envDays reads a day count from the environment and returns it as a
+// Duration; 0 (or a negative/invalid value) disables whatever feature it
+// configures.
+func envDays(key string, fallbackDays int) time.Duration {
+	days := fallbackDays
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			days = parsed
+		}
+	}
+	if days <= 0 {
+		return 0
+	}
+	return time.Duration(days) * 24 * time.Hour
 }

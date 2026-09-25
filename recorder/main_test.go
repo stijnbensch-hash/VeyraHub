@@ -12,7 +12,7 @@ import (
 
 func TestRecordingIsPersistentPrivateAndIdempotent(t *testing.T) {
 	root := t.TempDir()
-	r, err := newRecorder(filepath.Join(root, "data"), filepath.Join(root, "files"), "internal-test-token", "ffmpeg")
+	r, err := newRecorder(filepath.Join(root, "data"), filepath.Join(root, "files"), "internal-test-token", "ffmpeg", 30*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestRecordingIsPersistentPrivateAndIdempotent(t *testing.T) {
 		t.Fatalf("admin should see one recording: %+v", got)
 	}
 
-	reopened, err := newRecorder(filepath.Join(root, "data"), filepath.Join(root, "files"), "internal-test-token", "ffmpeg")
+	reopened, err := newRecorder(filepath.Join(root, "data"), filepath.Join(root, "files"), "internal-test-token", "ffmpeg", 30*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,8 +84,58 @@ func TestRecordingIsPersistentPrivateAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestRetentionRemovesOldCompletedRecordingsButKeepsRecentOnes(t *testing.T) {
+	root := t.TempDir()
+	r, err := newRecorder(filepath.Join(root, "data"), filepath.Join(root, "files"), "internal-test-token", "ffmpeg", 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	old := &recording{ID: "old", OwnerID: "viewer-1", Title: "Old episode", Status: "completed", End: time.Now().Add(-31 * 24 * time.Hour), Bytes: 10}
+	recent := &recording{ID: "recent", OwnerID: "viewer-1", Title: "Recent episode", Status: "completed", End: time.Now().Add(-1 * time.Hour), Bytes: 10}
+	scheduled := &recording{ID: "scheduled", OwnerID: "viewer-1", Title: "Upcoming episode", Status: "scheduled", Start: time.Now().Add(time.Hour), End: time.Now().Add(-40 * 24 * time.Hour)}
+	r.mu.Lock()
+	r.jobs[old.ID], r.jobs[recent.ID], r.jobs[scheduled.ID] = old, recent, scheduled
+	r.mu.Unlock()
+
+	// Scheduled recordings whose end already passed fail on their own tick
+	// (handled elsewhere); here we only care that retention leaves anything
+	// that isn't "completed" alone, and only removes the completed
+	// recording older than the retention window.
+	expired := r.tick()
+	if len(expired) != 1 || expired[0] != "old" {
+		t.Fatalf("expected only the old completed recording to expire, got %v", expired)
+	}
+	r.mu.Lock()
+	_, oldStillThere := r.jobs["old"]
+	_, recentStillThere := r.jobs["recent"]
+	r.mu.Unlock()
+	if oldStillThere {
+		t.Fatal("old completed recording should have been removed")
+	}
+	if !recentStillThere {
+		t.Fatal("recent completed recording should not have been removed")
+	}
+}
+
+func TestRetentionDisabledKeepsEverything(t *testing.T) {
+	root := t.TempDir()
+	r, err := newRecorder(filepath.Join(root, "data"), filepath.Join(root, "files"), "internal-test-token", "ffmpeg", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := &recording{ID: "old", OwnerID: "viewer-1", Title: "Ancient episode", Status: "completed", End: time.Now().Add(-365 * 24 * time.Hour), Bytes: 10}
+	r.mu.Lock()
+	r.jobs[old.ID] = old
+	r.mu.Unlock()
+
+	if expired := r.tick(); len(expired) != 0 {
+		t.Fatalf("retention is disabled, nothing should expire: %v", expired)
+	}
+}
+
 func TestRecorderRequiresInternalTokenAndHubIdentity(t *testing.T) {
-	r, err := newRecorder(filepath.Join(t.TempDir(), "data"), filepath.Join(t.TempDir(), "files"), "secret", "")
+	r, err := newRecorder(filepath.Join(t.TempDir(), "data"), filepath.Join(t.TempDir(), "files"), "secret", "", 30*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
