@@ -109,6 +109,11 @@ func addonServer(t *testing.T) *httptest.Server {
 			json.NewEncoder(w).Encode(map[string]any{"streams": []any{
 				map[string]any{"name": "1080p", "url": "https://media.example/tt1.m3u8"},
 			}})
+		case "/stream/movie/tt3.json":
+			json.NewEncoder(w).Encode(map[string]any{"streams": []any{
+				map[string]any{"name": "1080p", "url": "https://media.example/tt3-1080p.m3u8"},
+				map[string]any{"name": "4K", "url": "https://media.example/tt3-4k.m3u8"},
+			}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -237,7 +242,11 @@ func TestAddonHealthTransitionNotifiesAdmin(t *testing.T) {
 
 	addon.Close() // now every subsequent addon call fails
 
-	doJSON(t, http.MethodGet, server.URL+"/v1/streams/movie/tt1", adminToken, nil, http.StatusOK, nil)
+	// A different id than the first call: streams are now short-TTL cached
+	// by (mediaType, id), so re-requesting tt1 here would just return the
+	// already-cached (still "reachable") result without re-querying the
+	// addon at all, and the transition below would never fire.
+	doJSON(t, http.MethodGet, server.URL+"/v1/streams/movie/tt2", adminToken, nil, http.StatusOK, nil)
 
 	var notifications struct {
 		Notifications []Notification `json:"notifications"`
@@ -251,6 +260,162 @@ func TestAddonHealthTransitionNotifiesAdmin(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected an 'Addon onbereikbaar' notification, got %+v", notifications.Notifications)
+	}
+}
+
+// TestStreamRedirectsToRequestedMediaSource covers task #26: the Jellyfin
+// compatibility /Videos/{itemID}/stream endpoint must redirect to the exact
+// MediaSource a client picked in PlaybackInfo (via ?MediaSourceId=...),
+// not always the first stream any addon happened to return.
+func TestStreamRedirectsToRequestedMediaSource(t *testing.T) {
+	server, _, _ := setupHubWithAddon(t)
+
+	// PlaybackInfo/stream sit behind the Jellyfin-compatibility auth (a
+	// media session from /Users/AuthenticateByName), not the hub's own /v1
+	// admin session — same as a real Jellyfin/Emby client.
+	authBody, _ := json.Marshal(map[string]string{"Username": "admin", "Pw": "secret-password"})
+	authRequest, _ := http.NewRequest(http.MethodPost, server.URL+"/Users/AuthenticateByName", bytes.NewReader(authBody))
+	authRequest.Header.Set("Content-Type", "application/json")
+	authResponse, err := http.DefaultClient.Do(authRequest)
+	if err != nil || authResponse.StatusCode != http.StatusOK {
+		t.Fatalf("Jellyfin auth failed: %v status=%v", err, authResponse.StatusCode)
+	}
+	var jellyfinAuth struct {
+		AccessToken string `json:"AccessToken"`
+	}
+	if err := json.NewDecoder(authResponse.Body).Decode(&jellyfinAuth); err != nil {
+		t.Fatal(err)
+	}
+	authResponse.Body.Close()
+	mediaToken := jellyfinAuth.AccessToken
+
+	itemID := encodeHubID(hubItemID{Kind: "item", AddonID: "test.addon", MediaType: "movie", MediaID: "tt3"})
+
+	playbackInfoRequest, _ := http.NewRequest(http.MethodGet, server.URL+"/Items/"+itemID+"/PlaybackInfo", nil)
+	playbackInfoRequest.Header.Set("X-Emby-Token", mediaToken)
+	playbackInfoResponse, err := http.DefaultClient.Do(playbackInfoRequest)
+	if err != nil || playbackInfoResponse.StatusCode != http.StatusOK {
+		t.Fatalf("PlaybackInfo failed: %v status=%v", err, playbackInfoResponse.StatusCode)
+	}
+	var playbackInfo struct {
+		MediaSources []map[string]any `json:"MediaSources"`
+	}
+	if err := json.NewDecoder(playbackInfoResponse.Body).Decode(&playbackInfo); err != nil {
+		t.Fatal(err)
+	}
+	playbackInfoResponse.Body.Close()
+	if len(playbackInfo.MediaSources) != 2 {
+		t.Fatalf("expected 2 media sources for tt3, got %d", len(playbackInfo.MediaSources))
+	}
+
+	// PlaybackInfo's own MediaSource order (after ranking) is what "the
+	// first stream" means; read it back rather than assuming which of the
+	// two (1080p/4K) ranks first.
+	firstPath, _ := playbackInfo.MediaSources[0]["Path"].(string)
+	secondPath, _ := playbackInfo.MediaSources[1]["Path"].(string)
+	if firstPath == "" || secondPath == "" || firstPath == secondPath {
+		t.Fatalf("expected two distinct MediaSource paths, got %q and %q", firstPath, secondPath)
+	}
+
+	// Without a MediaSourceId, /stream keeps its old default of the first
+	// (ranked) stream — clients that never called PlaybackInfo still work.
+	noSourceClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	request, _ := http.NewRequest(http.MethodGet, server.URL+"/Videos/"+itemID+"/stream", nil)
+	request.Header.Set("X-Emby-Token", mediaToken)
+	response, err := noSourceClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("expected a redirect with no MediaSourceId: %v status=%v", err, response.StatusCode)
+	}
+	if got := response.Header.Get("Location"); got != firstPath {
+		t.Fatalf("expected the default (first ranked) stream %q, got %q", firstPath, got)
+	}
+
+	// The second MediaSource's id should redirect to the second stream, not
+	// the first — this is the actual bug being fixed.
+	secondSourceID, _ := playbackInfo.MediaSources[1]["Id"].(string)
+	request, _ = http.NewRequest(http.MethodGet, server.URL+"/Videos/"+itemID+"/stream?MediaSourceId="+secondSourceID, nil)
+	request.Header.Set("X-Emby-Token", mediaToken)
+	response, err = noSourceClient.Do(request)
+	if err != nil || response.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("expected a redirect with a MediaSourceId: %v status=%v", err, response.StatusCode)
+	}
+	if got := response.Header.Get("Location"); got != secondPath {
+		t.Fatalf("expected the chosen (second) stream %q, got %q", secondPath, got)
+	}
+}
+
+// TestPlaybackProgressRoundTrips covers task #25: a client can report a
+// resume position and read it back, a position near the reported duration
+// is treated as finished (and no longer offered as "resume"), and an
+// explicit clear removes it.
+func TestPlaybackProgressRoundTrips(t *testing.T) {
+	server, _, adminToken := setupHubWithAddon(t)
+
+	var initial struct {
+		Found bool `json:"found"`
+	}
+	doJSON(t, http.MethodGet, server.URL+"/api/v1/items/movie/tt1/progress", adminToken, nil, http.StatusOK, &initial)
+	if initial.Found {
+		t.Fatalf("expected no progress yet, got %+v", initial)
+	}
+
+	// Below the minimum resumable position: stored, but not reported back
+	// as something to resume from.
+	var tooShort struct {
+		PositionSeconds float64 `json:"positionSeconds"`
+	}
+	doJSON(t, http.MethodPut, server.URL+"/api/v1/items/movie/tt1/progress", adminToken,
+		map[string]any{"positionSeconds": 5, "durationSeconds": 6000}, http.StatusOK, &tooShort)
+	var afterTooShort struct {
+		Found bool `json:"found"`
+	}
+	doJSON(t, http.MethodGet, server.URL+"/api/v1/items/movie/tt1/progress", adminToken, nil, http.StatusOK, &afterTooShort)
+	if afterTooShort.Found {
+		t.Fatalf("expected a 5s position to not be resumable, got %+v", afterTooShort)
+	}
+
+	// A real mid-playback position round-trips.
+	doJSON(t, http.MethodPut, server.URL+"/api/v1/items/movie/tt1/progress", adminToken,
+		map[string]any{"positionSeconds": 120, "durationSeconds": 6000}, http.StatusOK, nil)
+	var midway struct {
+		Found           bool    `json:"found"`
+		PositionSeconds float64 `json:"positionSeconds"`
+		DurationSeconds float64 `json:"durationSeconds"`
+	}
+	doJSON(t, http.MethodGet, server.URL+"/api/v1/items/movie/tt1/progress", adminToken, nil, http.StatusOK, &midway)
+	if !midway.Found || midway.PositionSeconds != 120 || midway.DurationSeconds != 6000 {
+		t.Fatalf("expected the stored position to round-trip, got %+v", midway)
+	}
+
+	// A position within 95% of the duration counts as finished and is no
+	// longer offered as a resume point.
+	var nearEnd struct {
+		Finished bool `json:"finished"`
+	}
+	doJSON(t, http.MethodPut, server.URL+"/api/v1/items/movie/tt1/progress", adminToken,
+		map[string]any{"positionSeconds": 5900, "durationSeconds": 6000}, http.StatusOK, &nearEnd)
+	if !nearEnd.Finished {
+		t.Fatalf("expected a near-end position to be marked finished")
+	}
+	var afterFinish struct {
+		Found bool `json:"found"`
+	}
+	doJSON(t, http.MethodGet, server.URL+"/api/v1/items/movie/tt1/progress", adminToken, nil, http.StatusOK, &afterFinish)
+	if afterFinish.Found {
+		t.Fatalf("expected a finished title to no longer be resumable, got %+v", afterFinish)
+	}
+
+	// A separate title's progress is independent, and an explicit clear
+	// removes it.
+	doJSON(t, http.MethodPut, server.URL+"/api/v1/items/movie/tt2/progress", adminToken,
+		map[string]any{"positionSeconds": 300, "durationSeconds": 6000}, http.StatusOK, nil)
+	doJSON(t, http.MethodDelete, server.URL+"/api/v1/items/movie/tt2/progress", adminToken, nil, http.StatusNoContent, nil)
+	var afterClear struct {
+		Found bool `json:"found"`
+	}
+	doJSON(t, http.MethodGet, server.URL+"/api/v1/items/movie/tt2/progress", adminToken, nil, http.StatusOK, &afterClear)
+	if afterClear.Found {
+		t.Fatalf("expected a cleared position to no longer be found, got %+v", afterClear)
 	}
 }
 
@@ -326,5 +491,97 @@ func TestRequestLifecycleNotifiesRequester(t *testing.T) {
 	doJSON(t, http.MethodGet, server.URL+"/v1/me/notifications", adminToken, nil, http.StatusOK, &adminNotifications)
 	if len(adminNotifications.Notifications) != 0 {
 		t.Fatalf("expected the admin to not receive the requester's own notification, got %+v", adminNotifications.Notifications)
+	}
+}
+
+// TestLoginLimiterLocksAfterRepeatedFailures is a pure unit test of the
+// loginLimiter type itself (no HTTP), covering the mechanics the login
+// doors rely on: it locks a (ip, username) pair after loginMaxFailures
+// failures, leaves other (ip, username) pairs unaffected, and a success
+// clears the history.
+func TestLoginLimiterLocksAfterRepeatedFailures(t *testing.T) {
+	limiter := newLoginLimiter()
+
+	for i := 0; i < loginMaxFailures-1; i++ {
+		limiter.recordFailure("1.2.3.4", "admin")
+		if locked, _ := limiter.locked("1.2.3.4", "admin"); locked {
+			t.Fatalf("expected not locked after %d failure(s)", i+1)
+		}
+	}
+
+	limiter.recordFailure("1.2.3.4", "admin")
+	locked, remaining := limiter.locked("1.2.3.4", "admin")
+	if !locked || remaining <= 0 {
+		t.Fatalf("expected locked after %d failures, got locked=%v remaining=%v", loginMaxFailures, locked, remaining)
+	}
+
+	// Lockout is per (ip, username), not just per username: a different IP
+	// trying the same account is unaffected.
+	if otherLocked, _ := limiter.locked("5.6.7.8", "admin"); otherLocked {
+		t.Fatalf("expected a different IP to not be locked out")
+	}
+
+	// A successful login clears the failure history.
+	limiter.recordSuccess("1.2.3.4", "admin")
+	if stillLocked, _ := limiter.locked("1.2.3.4", "admin"); stillLocked {
+		t.Fatalf("expected recordSuccess to clear the lockout")
+	}
+}
+
+// TestLoginLockoutAppliesAcrossBothAuthEndpoints covers task #27 end to
+// end: repeated failed logins against /v1/auth/login lock out the
+// (ip, username) pair — even a subsequent CORRECT password is refused — and
+// the Jellyfin-compatibility login door (/Users/AuthenticateByName) shares
+// that same lockout, since both check the same credentials.
+func TestLoginLockoutAppliesAcrossBothAuthEndpoints(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "hub.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := NewHub(store, "admin", "secret-password", nil)
+	server := httptest.NewServer(hub.Routes())
+	defer server.Close()
+
+	loginAttempt := func(password string) *http.Response {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"username": "admin", "password": password})
+		request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/auth/login", bytes.NewReader(body))
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	for i := 0; i < loginMaxFailures; i++ {
+		response := loginAttempt("wrong-password")
+		if response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d", i+1, response.StatusCode)
+		}
+		response.Body.Close()
+	}
+
+	// One more attempt — even with the CORRECT password — should now be
+	// locked out.
+	response := loginAttempt("secret-password")
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 once locked out, got %d", response.StatusCode)
+	}
+	if response.Header.Get("Retry-After") == "" {
+		t.Fatalf("expected a Retry-After header on a locked-out response")
+	}
+	response.Body.Close()
+
+	// The Jellyfin-compatibility login door shares the same limiter.
+	authBody, _ := json.Marshal(map[string]string{"Username": "admin", "Pw": "secret-password"})
+	authRequest, _ := http.NewRequest(http.MethodPost, server.URL+"/Users/AuthenticateByName", bytes.NewReader(authBody))
+	authRequest.Header.Set("Content-Type", "application/json")
+	authResponse, err := http.DefaultClient.Do(authRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authResponse.Body.Close()
+	if authResponse.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected the Jellyfin auth door to share the lockout, got %d", authResponse.StatusCode)
 	}
 }

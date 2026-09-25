@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -10,11 +12,11 @@ import (
 var errNotificationNotFound = errors.New("notification not found")
 
 // Notification is an in-hub message for one account, delivered by polling
-// (GET /v1/me/notifications) rather than true push. Real APNs/FCM delivery
-// needs push credentials this deployment doesn't have configured, so
-// PushToken below only registers the device's token for when that's added;
-// today's actual delivery mechanism is this feed. A Veyra client can poll
-// it on a timer or when foregrounded, same as any other sync document.
+// (GET /v1/me/notifications) and, when the hub has APNs credentials
+// configured (see apns.go and Hub.notify), also pushed to the account's
+// registered devices. Push delivery is best-effort on top of this feed, not
+// a replacement for it: a Veyra client can still poll this feed on a timer
+// or when foregrounded, same as any other sync document.
 type Notification struct {
 	ID        string     `json:"id"`
 	UserID    string     `json:"userID"`
@@ -24,10 +26,10 @@ type Notification struct {
 	ReadAt    *time.Time `json:"readAt,omitempty"`
 }
 
-// PushToken is a device's registered push token, stored for future use once
-// real push delivery (APNs) is wired up. Registering a token today has no
-// visible effect beyond being stored; notifications still arrive via the
-// poll-based feed.
+// PushToken is a device's registered push token, used by Hub.notify to
+// deliver a push notification via APNs whenever the hub has push
+// credentials configured. Notifications always land in the poll-based feed
+// regardless; a registered token only adds push delivery on top.
 type PushToken struct {
 	UserID    string    `json:"userID"`
 	DeviceID  string    `json:"deviceID"`
@@ -87,6 +89,44 @@ func (s *Store) UpsertPushToken(token PushToken) error {
 	}
 	s.state.PushTokens = append(s.state.PushTokens, token)
 	return s.persistLocked()
+}
+
+func (s *Store) PushTokensForUser(userID string) []PushToken {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []PushToken
+	for _, token := range s.state.PushTokens {
+		if token.UserID == userID {
+			result = append(result, token)
+		}
+	}
+	return result
+}
+
+// notify records a notification in the poll-based feed and, when the hub
+// has APNs configured (Hub.apns != nil), also attempts to push it to every
+// device the user has registered a push token for. Push delivery is
+// best-effort: it runs per device in its own goroutine and only ever logs a
+// failure, never blocking or failing the caller — the caller's own action
+// (an addon health change, a request being resolved, ...) has already
+// succeeded by the time notify is called.
+func (h *Hub) notify(userID, title, body string) Notification {
+	notification := h.store.CreateNotification(userID, title, body)
+	if h.apns == nil {
+		return notification
+	}
+	for _, token := range h.store.PushTokensForUser(userID) {
+		go h.sendPush(token, title, body)
+	}
+	return notification
+}
+
+func (h *Hub) sendPush(token PushToken, title, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := h.apns.send(ctx, token.Token, title, body); err != nil {
+		slog.Warn("apns delivery failed", "deviceID", token.DeviceID, "error", err)
+	}
 }
 
 func (h *Hub) registerNotificationRoutes(mux *http.ServeMux) {

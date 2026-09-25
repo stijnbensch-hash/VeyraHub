@@ -112,14 +112,16 @@ type State struct {
 
 	// Feature stores added alongside the original data model. Each follows
 	// the same per-user-slice-in-State shape as UserAddons/VeyraSync above.
-	ContentFilters   []ContentFilter   `json:"contentFilters,omitempty"`
-	SmartCollections []SmartCollection `json:"smartCollections,omitempty"`
-	Profiles         []Profile         `json:"profiles,omitempty"`
-	ProfileUsage     []ProfileUsage    `json:"profileUsage,omitempty"`
-	Notifications    []Notification    `json:"notifications,omitempty"`
-	PushTokens       []PushToken       `json:"pushTokens,omitempty"`
-	Sources          []Source          `json:"sources,omitempty"`
-	Requests         []MediaRequest    `json:"requests,omitempty"`
+	ContentFilters   []ContentFilter    `json:"contentFilters,omitempty"`
+	SmartCollections []SmartCollection  `json:"smartCollections,omitempty"`
+	Profiles         []Profile          `json:"profiles,omitempty"`
+	ProfileUsage     []ProfileUsage     `json:"profileUsage,omitempty"`
+	Notifications    []Notification     `json:"notifications,omitempty"`
+	PushTokens       []PushToken        `json:"pushTokens,omitempty"`
+	Sources          []Source           `json:"sources,omitempty"`
+	Requests         []MediaRequest     `json:"requests,omitempty"`
+	Progress         []PlaybackProgress `json:"progress,omitempty"`
+	AuditLog         []AuditEntry       `json:"auditLog,omitempty"`
 }
 
 type Store struct {
@@ -217,6 +219,7 @@ func (s *Store) Snapshot() State {
 	copyState.PushTokens = append([]PushToken{}, s.state.PushTokens...)
 	copyState.Sources = append([]Source{}, s.state.Sources...)
 	copyState.Requests = append([]MediaRequest{}, s.state.Requests...)
+	copyState.AuditLog = append([]AuditEntry{}, s.state.AuditLog...)
 
 	return copyState
 }

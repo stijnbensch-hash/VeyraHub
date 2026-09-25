@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +28,35 @@ type Hub struct {
 	store    *Store
 	username string
 	client   *http.Client
+
+	// catalogCache/streamCache hold short-lived results of fetchCatalog and
+	// aggregateStreams so browsing the catalog or repeatedly opening a
+	// title doesn't re-query every addon on every request. See ttlCache in
+	// cache.go.
+	catalogCache *ttlCache[[]stremioMeta]
+	streamCache  *ttlCache[[]HubStream]
+
+	// loginLimiter throttles repeated failed logins across both login
+	// doors (login below and jellyfinAuthenticate in jellyfin.go). See
+	// ratelimit.go.
+	loginLimiter *loginLimiter
+
+	// apns delivers push notifications via Apple's APNs when configured
+	// (see EnableAPNs and apns.go). nil means push isn't configured for
+	// this deployment: notify still records every notification in the
+	// poll-based feed, it just skips the push attempt.
+	apns *apnsClient
 }
+
+// catalogCacheTTL/streamCacheTTL are short on purpose: long enough to
+// absorb the burst of repeat requests a single "open the catalog" or "open
+// a title" action causes (multiple clients, retries, the Jellyfin bridge
+// and native API both hitting the same data), short enough that a newly
+// added addon or a stream link going stale is never out of date for long.
+const (
+	catalogCacheTTL = 45 * time.Second
+	streamCacheTTL  = 45 * time.Second
+)
 
 type addonManifest struct {
 	ID          string          `json:"id"`
@@ -100,7 +129,26 @@ func NewHub(store *Store, bootstrapUsername, bootstrapPassword string, client *h
 			slog.Error("cannot bootstrap admin account", "error", err)
 		}
 	}
-	return &Hub{store: store, username: bootstrapUsername, client: client}
+	return &Hub{
+		store: store, username: bootstrapUsername, client: client,
+		catalogCache: newTTLCache[[]stremioMeta](catalogCacheTTL),
+		streamCache:  newTTLCache[[]HubStream](streamCacheTTL),
+		loginLimiter: newLoginLimiter(),
+	}
+}
+
+// EnableAPNs wires up push delivery via Apple's APNs using previously
+// loaded credentials (see loadAPNsConfig). Called from main after
+// constructing the hub, rather than folded into NewHub's own signature,
+// since NewHub's 4-argument signature is depended on by many existing
+// tests and call sites and push credentials are optional. A zero-value
+// (unconfigured) config is a no-op, so callers can pass whatever
+// loadAPNsConfig returned unconditionally.
+func (h *Hub) EnableAPNs(config APNsConfig) {
+	if !config.configured() {
+		return
+	}
+	h.apns = newAPNsClient(config)
 }
 
 func (h *Hub) Routes() http.Handler {
@@ -134,6 +182,8 @@ func (h *Hub) Routes() http.Handler {
 	h.registerNotificationRoutes(mux)
 	h.registerSourceRoutes(mux)
 	h.registerRequestRoutes(mux)
+	h.registerAuditRoutes(mux)
+	h.registerRecorderRoutes(mux)
 	return securityHeaders(mux)
 }
 
@@ -142,6 +192,32 @@ func (h *Hub) Routes() http.Handler {
 func (h *Hub) requireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
+		session, user, ok := h.store.SessionByAccessToken(token)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "Een geldige sessie is vereist. Log opnieuw in.")
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxUserKey, user)
+		ctx = context.WithValue(ctx, ctxSessionKey, session)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// requireSessionAllowQueryToken is like requireSession but also accepts the
+// session's access token as an "access_token" query parameter (in addition
+// to the usual Authorization header). Native media players (AVPlayer, etc.)
+// open a URL directly without attaching custom HTTP headers, so a route a
+// player opens on its own — such as the recorder's file-download route —
+// needs the token available in the URL itself, the same way Jellyfin's own
+// stream endpoints accept "api_key". Every other authenticated route keeps
+// requiring the header via requireSession; this is intentionally used only
+// where a bare URL must work.
+func (h *Hub) requireSessionAllowQueryToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := bearerToken(r)
+		if token == "" {
+			token = strings.TrimSpace(r.URL.Query().Get("access_token"))
+		}
 		session, user, ok := h.store.SessionByAccessToken(token)
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "Een geldige sessie is vereist. Log opnieuw in.")
@@ -195,9 +271,9 @@ func (h *Hub) recordAddonHealth(id string, ok bool, message string) {
 	transition, addonName := h.store.RecordAddonHealthForUser(adminID, id, ok, message)
 	switch transition {
 	case addonHealthBecameUnreachable:
-		h.store.CreateNotification(adminID, "Addon onbereikbaar", addonName+" is niet meer bereikbaar.")
+		h.notify(adminID, "Addon onbereikbaar", addonName+" is niet meer bereikbaar.")
 	case addonHealthBecameReachable:
-		h.store.CreateNotification(adminID, "Addon weer bereikbaar", addonName+" is weer bereikbaar.")
+		h.notify(adminID, "Addon weer bereikbaar", addonName+" is weer bereikbaar.")
 	}
 }
 
@@ -229,12 +305,43 @@ func (h *Hub) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Ongeldige aanvraag.")
 		return
 	}
-	user, ok := h.store.Authenticate(strings.TrimSpace(input.Username), input.Password)
+
+	username := strings.TrimSpace(input.Username)
+	ip := clientIP(r)
+
+	if writeIfLoginLocked(w, h.loginLimiter, ip, username) {
+		return
+	}
+
+	user, ok := h.store.Authenticate(username, input.Password)
 	if !ok {
+		h.loginLimiter.recordFailure(ip, username)
 		writeError(w, http.StatusUnauthorized, "Gebruikersnaam of wachtwoord onjuist.")
 		return
 	}
+	h.loginLimiter.recordSuccess(ip, username)
 	writeSessionResponse(w, h.store, user, input.DeviceID, input.DeviceName)
+}
+
+// writeIfLoginLocked writes a 429 (with Retry-After) and returns true when
+// this (ip, username) pair is currently locked out from too many failed
+// login attempts. Shared by login and jellyfinAuthenticate, the two doors
+// that check a password.
+func writeIfLoginLocked(w http.ResponseWriter, limiter *loginLimiter, ip, username string) bool {
+	locked, remaining := limiter.locked(ip, username)
+	if !locked {
+		return false
+	}
+	seconds := int(remaining.Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	writeError(w, http.StatusTooManyRequests, fmt.Sprintf(
+		"Te veel mislukte inlogpogingen. Probeer het over %d minuten opnieuw.",
+		(seconds+59)/60,
+	))
+	return true
 }
 
 // refreshToken rotates a session's access/refresh tokens without asking for
@@ -323,10 +430,12 @@ func (h *Hub) listSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Hub) revokeSession(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.RevokeSession(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := h.store.RevokeSession(id); err != nil {
 		writeError(w, http.StatusNotFound, "Sessie niet gevonden.")
 		return
 	}
+	h.audit(r, "session.revoke", "session", id, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -371,6 +480,7 @@ func (h *Hub) addUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "De gebruiker kon niet worden opgeslagen.")
 		return
 	}
+	h.audit(r, "user.create", "user", user.ID, user.Username)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id": user.ID, "username": user.Username, "enabled": user.Enabled, "createdAt": user.CreatedAt,
 	})
@@ -391,6 +501,11 @@ func (h *Hub) patchUser(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "Gebruiker niet gevonden.")
 			return
 		}
+		action := "user.disable"
+		if *input.Enabled {
+			action = "user.enable"
+		}
+		h.audit(r, action, "user", id, "")
 	}
 	if input.Password != nil {
 		if len(*input.Password) < minPasswordLength {
@@ -404,16 +519,29 @@ func (h *Hub) patchUser(w http.ResponseWriter, r *http.Request) {
 		// A password reset signs every device for this account out, so the
 		// old password can no longer be used to keep a session alive.
 		_ = h.store.RevokeUserSessions(id)
+		h.audit(r, "user.reset_password", "user", id, "")
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Hub) deleteUser(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.DeleteUser(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	existing, _ := h.store.UserByID(id)
+	if err := h.store.DeleteUser(id); err != nil {
 		writeError(w, http.StatusNotFound, "Gebruiker niet gevonden.")
 		return
 	}
+	h.audit(r, "user.delete", "user", id, existing.Username)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// invalidateAddonCaches drops all cached catalog/stream results. Called
+// whenever the addon list itself changes (added, edited, enabled/disabled,
+// reordered, or removed) so such a change is reflected immediately instead
+// of waiting out the cache TTL.
+func (h *Hub) invalidateAddonCaches() {
+	h.catalogCache.clear()
+	h.streamCache.clear()
 }
 
 func (h *Hub) listAddons(w http.ResponseWriter, r *http.Request) {
@@ -526,6 +654,8 @@ func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "De addon kon niet worden opgeslagen.")
 		return
 	}
+	h.invalidateAddonCaches()
+	h.audit(r, "addon.add", "addon", addon.ID, addon.Name)
 	writeJSON(w, http.StatusCreated, addon)
 }
 
@@ -573,6 +703,8 @@ func (h *Hub) refreshAddon(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "De addon kon niet worden opgeslagen.")
 		return
 	}
+	h.invalidateAddonCaches()
+	h.audit(r, "addon.refresh", "addon", updated.ID, updated.Name)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -585,19 +717,30 @@ func (h *Hub) patchAddon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	admin, _ := r.Context().Value(ctxUserKey).(User)
-	if err := h.store.SetAddonEnabledForUser(admin.ID, r.PathValue("id"), *input.Enabled); err != nil {
+	id := r.PathValue("id")
+	if err := h.store.SetAddonEnabledForUser(admin.ID, id, *input.Enabled); err != nil {
 		writeError(w, http.StatusNotFound, "Addon niet gevonden.")
 		return
 	}
+	h.invalidateAddonCaches()
+	action := "addon.disable"
+	if *input.Enabled {
+		action = "addon.enable"
+	}
+	h.audit(r, action, "addon", id, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Hub) deleteAddon(w http.ResponseWriter, r *http.Request) {
 	admin, _ := r.Context().Value(ctxUserKey).(User)
-	if err := h.store.DeleteAddonForUser(admin.ID, r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	existing, _ := h.store.FindAddonForUser(admin.ID, id)
+	if err := h.store.DeleteAddonForUser(admin.ID, id); err != nil {
 		writeError(w, http.StatusNotFound, "Addon niet gevonden.")
 		return
 	}
+	h.invalidateAddonCaches()
+	h.audit(r, "addon.delete", "addon", id, existing.Name)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -614,6 +757,7 @@ func (h *Hub) moveAddon(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Addon niet gevonden.")
 		return
 	}
+	h.invalidateAddonCaches()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -630,6 +774,11 @@ func (h *Hub) streams(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubStream {
+	cacheKey := mediaType + "\x00" + id
+	if cached, ok := h.streamCache.get(cacheKey); ok {
+		return cached
+	}
+
 	addons := h.addonCatalog()
 	var enabled []Addon
 	for _, addon := range addons {
@@ -678,6 +827,7 @@ func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubS
 		rank[addon.ID] = index
 	}
 	values = rankStreams(values, rank)
+	h.streamCache.set(cacheKey, values)
 	return values
 }
 

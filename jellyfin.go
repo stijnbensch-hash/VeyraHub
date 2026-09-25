@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"hash/fnv"
 	"net/http"
 	"strconv"
 	"strings"
@@ -30,6 +31,24 @@ type hubItemID struct {
 	// carry the Source id — same neutral hubItemID shape, no new library
 	// concept needed for it).
 	Path string `json:"pa,omitempty"`
+
+	// StreamRef identifies one specific stream among the (possibly several)
+	// streams a single addon returns for the same title — e.g. a 1080p and
+	// a 4K release from the same addon. Kind == "stream" MediaSource ids
+	// carry this (see jellyfinPlaybackInfo/streamRef) so jellyfinStream can
+	// redirect to the exact source a client picked instead of always the
+	// first stream any addon happened to return.
+	StreamRef string `json:"r,omitempty"`
+}
+
+// streamRef derives a short, stable identifier for one HubStream, used to
+// tell apart multiple streams from the same addon within a MediaSource id.
+// It hashes the stream's URL rather than embedding it so the id stays
+// short, even though it still round-trips through client requests.
+func streamRef(stream HubStream) string {
+	hash := fnv.New32a()
+	hash.Write([]byte(stream.URL))
+	return strconv.FormatUint(uint64(hash.Sum32()), 36)
 }
 
 func (h *Hub) registerJellyfinRoutes(mux *http.ServeMux) {
@@ -64,11 +83,21 @@ func (h *Hub) jellyfinAuthenticate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "Gebruikersnaam of wachtwoord onjuist.")
 		return
 	}
-	user, ok := h.store.Authenticate(strings.TrimSpace(input.Username), input.Password)
+
+	username := strings.TrimSpace(input.Username)
+	ip := clientIP(r)
+
+	if writeIfLoginLocked(w, h.loginLimiter, ip, username) {
+		return
+	}
+
+	user, ok := h.store.Authenticate(username, input.Password)
 	if !ok {
+		h.loginLimiter.recordFailure(ip, username)
 		writeError(w, http.StatusUnauthorized, "Gebruikersnaam of wachtwoord onjuist.")
 		return
 	}
+	h.loginLimiter.recordSuccess(ip, username)
 	fields := embyAuthFields(r.Header.Get("X-Emby-Authorization"))
 	_, accessToken, err := h.store.CreateMediaSession(user.ID, fields["DeviceId"], fields["Device"])
 	if err != nil {
@@ -310,6 +339,7 @@ func (h *Hub) jellyfinPlaybackInfo(w http.ResponseWriter, r *http.Request) {
 			MediaType: item.MediaType,
 			MediaID:   item.MediaID,
 			Name:      name,
+			StreamRef: streamRef(stream),
 		})
 
 		source := map[string]any{
@@ -331,6 +361,13 @@ func (h *Hub) jellyfinPlaybackInfo(w http.ResponseWriter, r *http.Request) {
 			"Bitrate":                    0,
 			"DefaultAudioStreamIndex":    nil,
 			"DefaultSubtitleStreamIndex": nil,
+			// Veyra-Hub-specifieke uitbreiding op de Jellyfin-MediaSource-vorm
+			// (zoals GroupId/GroupName al bij Views bestaat): laat een
+			// Veyra-client deze bron aan de addon toeschrijven die hem
+			// leverde, i.p.v. alles onder de hub-servernaam te tonen. Een
+			// echte Jellyfin/Emby-server stuurt deze velden niet mee.
+			"AddonId":   stream.AddonID,
+			"AddonName": stream.AddonName,
 		}
 
 		if stream.Filename != "" {
@@ -375,7 +412,42 @@ func (h *Hub) jellyfinStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Geen directe bron gevonden.")
 		return
 	}
-	http.Redirect(w, r, streams[0].URL, http.StatusTemporaryRedirect)
+	http.Redirect(w, r, chosenStreamURL(streams, requestedMediaSourceID(r)), http.StatusTemporaryRedirect)
+}
+
+// requestedMediaSourceID reads the MediaSource id a client picked in
+// PlaybackInfo and now wants to play, from wherever a Jellyfin/Emby client
+// may send it: the standard "MediaSourceId" query parameter (Jellyfin's own
+// clients vary its casing) or, for a POST-style PlaySessionId-only client,
+// left blank so the caller falls back to the first stream.
+func requestedMediaSourceID(r *http.Request) string {
+	query := r.URL.Query()
+	for _, key := range []string{"MediaSourceId", "mediaSourceId", "MediaSourceID"} {
+		if value := strings.TrimSpace(query.Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// chosenStreamURL picks the URL to redirect to for a /stream request: the
+// specific stream the client asked for via mediaSourceId (matched by its
+// StreamRef, the same hash jellyfinPlaybackInfo used to build that source's
+// id) if one was given and still present among the current streams,
+// otherwise falls back to the first stream — the previous, only, behavior —
+// so clients that call /stream directly without a prior PlaybackInfo still
+// work.
+func chosenStreamURL(streams []HubStream, mediaSourceID string) string {
+	if mediaSourceID != "" {
+		if chosen, err := decodeHubID(mediaSourceID); err == nil && chosen.Kind == "stream" {
+			for _, stream := range streams {
+				if streamRef(stream) == chosen.StreamRef {
+					return stream.URL
+				}
+			}
+		}
+	}
+	return streams[0].URL
 }
 
 func (h *Hub) searchCatalogs(ctx context.Context, query string, filter ContentFilter) []map[string]any {

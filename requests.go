@@ -172,9 +172,11 @@ func (h *Hub) patchRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if request.Status == requestStatusResolved {
-		h.store.CreateNotification(request.UserID, "Aanvraag toegevoegd", request.Query+" is toegevoegd.")
+		h.notify(request.UserID, "Aanvraag toegevoegd", request.Query+" is toegevoegd.")
+		h.audit(r, "request.resolve", "request", request.ID, request.Query)
 	} else if request.Status == requestStatusDeclined {
-		h.store.CreateNotification(request.UserID, "Aanvraag afgewezen", request.Query+" kon niet worden toegevoegd.")
+		h.notify(request.UserID, "Aanvraag afgewezen", request.Query+" kon niet worden toegevoegd.")
+		h.audit(r, "request.decline", "request", request.ID, request.Query)
 	}
 	writeJSON(w, http.StatusOK, request)
 }
