@@ -39,6 +39,9 @@ func (h *Hub) registerNativeRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/items/{type}/{id}", h.requireSession(h.nativeItem))
 	mux.HandleFunc("GET /api/v1/items/{type}/{id}/streams", h.requireSession(h.nativeStreams))
 	mux.HandleFunc("GET /api/v1/items/{type}/{id}/subtitles", h.requireSession(h.nativeSubtitles))
+	mux.HandleFunc("GET /api/v1/items/{type}/{id}/progress", h.requireSession(h.nativeGetProgress))
+	mux.HandleFunc("PUT /api/v1/items/{type}/{id}/progress", h.requireSession(h.nativePutProgress))
+	mux.HandleFunc("DELETE /api/v1/items/{type}/{id}/progress", h.requireSession(h.nativeDeleteProgress))
 }
 
 func (h *Hub) nativeCatalogs(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +215,89 @@ func (h *Hub) nativeStreams(w http.ResponseWriter, r *http.Request) {
 		"streams": values,
 		"count":   len(values),
 	})
+}
+
+// nativeGetProgress returns the signed-in user's stored resume position for
+// one title, if any — read by the client when starting playback so it can
+// offer/resume from where the same account left off on any device.
+func (h *Hub) nativeGetProgress(w http.ResponseWriter, r *http.Request) {
+	mediaType := r.PathValue("type")
+	id := strings.TrimSpace(r.PathValue("id"))
+	if !isMediaType(mediaType) || id == "" {
+		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
+		return
+	}
+	mediaType, id = resolveNativeMediaID(mediaType, id)
+
+	user, _ := userFromContext(r)
+	progress, ok := h.store.ProgressForUser(user.ID, mediaType, id)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"found": false})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"found":           true,
+		"positionSeconds": progress.PositionSeconds,
+		"durationSeconds": progress.DurationSeconds,
+		"updatedAt":       progress.UpdatedAt,
+	})
+}
+
+// nativePutProgress records the client's current playback position for one
+// title, sent periodically while playing (and once more at the end/on
+// stop). The hub never measures playback time itself — this is exactly
+// what the client reports.
+func (h *Hub) nativePutProgress(w http.ResponseWriter, r *http.Request) {
+	mediaType := r.PathValue("type")
+	id := strings.TrimSpace(r.PathValue("id"))
+	if !isMediaType(mediaType) || id == "" {
+		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
+		return
+	}
+	mediaType, id = resolveNativeMediaID(mediaType, id)
+
+	var input struct {
+		PositionSeconds float64 `json:"positionSeconds"`
+		DurationSeconds float64 `json:"durationSeconds"`
+	}
+	if decodeJSON(r, &input) != nil || input.PositionSeconds < 0 {
+		writeError(w, http.StatusBadRequest, "Ongeldige kijkpositie.")
+		return
+	}
+
+	user, _ := userFromContext(r)
+	progress, err := h.store.SetProgressForUser(user.ID, mediaType, id, input.PositionSeconds, input.DurationSeconds)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Kijkpositie opslaan is mislukt.")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"positionSeconds": progress.PositionSeconds,
+		"durationSeconds": progress.DurationSeconds,
+		"finished":        progress.Finished,
+		"updatedAt":       progress.UpdatedAt,
+	})
+}
+
+// nativeDeleteProgress clears a stored resume position — e.g. the client
+// explicitly restarted a title from the beginning rather than resuming.
+func (h *Hub) nativeDeleteProgress(w http.ResponseWriter, r *http.Request) {
+	mediaType := r.PathValue("type")
+	id := strings.TrimSpace(r.PathValue("id"))
+	if !isMediaType(mediaType) || id == "" {
+		writeError(w, http.StatusBadRequest, "Ongeldig mediatype of id.")
+		return
+	}
+	mediaType, id = resolveNativeMediaID(mediaType, id)
+
+	user, _ := userFromContext(r)
+	if err := h.store.ClearProgressForUser(user.ID, mediaType, id); err != nil {
+		writeError(w, http.StatusInternalServerError, "Kijkpositie verwijderen is mislukt.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Hub) nativeSubtitles(w http.ResponseWriter, r *http.Request) {
