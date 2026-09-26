@@ -472,7 +472,20 @@ func (r *recorder) tick() []string {
 
 func (r *recorder) capture(ctx context.Context, id, source string, remaining time.Duration) {
 	path := r.filePath(id)
-	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", source, "-t", fmt.Sprintf("%.0f", remaining.Seconds()), "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-f", "mpegts", path}
+	// IPTV sources routinely drop the connection mid-stream (a brief network
+	// blip, or the provider enforcing a single-connection limit while another
+	// device briefly touched the same account) and ffmpeg would otherwise just
+	// exit there, leaving a recording cut short with no error surfaced -- these
+	// reconnect flags make ffmpeg's own HTTP client retry the connection and
+	// keep writing to the same output instead of giving up.
+	args := []string{
+		"-nostdin", "-hide_banner", "-loglevel", "error",
+		"-reconnect", "1",
+		"-reconnect_at_eof", "1",
+		"-reconnect_streamed", "1",
+		"-reconnect_delay_max", "30",
+		"-y", "-i", source, "-t", fmt.Sprintf("%.0f", remaining.Seconds()), "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-f", "mpegts", path,
+	}
 	cmd := exec.CommandContext(ctx, r.ffmpeg, args...)
 	// Source URLs can contain provider credentials; never log command arguments or stderr.
 	err := cmd.Run()
