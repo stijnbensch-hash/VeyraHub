@@ -320,6 +320,16 @@ func embyAuthFields(header string) map[string]string {
 // separately. Smart collections and local sources aren't addons, so they
 // get a fixed, synthetic group instead of an addon id/name.
 func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
+	items := h.jellyfinViewItems()
+	writeJSON(w, http.StatusOK, map[string]any{"Items": items, "TotalRecordCount": len(items)})
+}
+
+// jellyfinViewItems builds the same "View" list jellyfinViews answers with,
+// factored out so jellyfinItems can hand it back for an unscoped browse
+// (GET /Users/{userID}/Items with no ParentId) too — the same fallback
+// real Jellyfin servers give a client that hasn't picked a library yet,
+// rather than an empty list that reads as "nothing here".
+func (h *Hub) jellyfinViewItems() []map[string]any {
 	const smartCollectionsGroupID = "smart-collections"
 	const smartCollectionsGroupName = "Slimme collecties"
 	const localSourcesGroupID = "local-sources"
@@ -372,7 +382,7 @@ func (h *Hub) jellyfinViews(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []map[string]any{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"Items": items, "TotalRecordCount": len(items)})
+	return items
 }
 
 func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +418,12 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if search != "" {
 		values = h.searchCatalogs(r.Context(), search, filter)
+	} else {
+		// No ParentId and no SearchTerm: a client browsing without having
+		// picked a library yet. Real Jellyfin servers answer this with the
+		// user's top-level items — here, the same library list Views
+		// returns — rather than an empty page that reads as "no content".
+		values = h.jellyfinViewItems()
 	}
 
 	values = filterJellyfinTypes(values, r.URL.Query().Get("IncludeItemTypes"))
