@@ -53,15 +53,32 @@ func streamRef(stream HubStream) string {
 
 func (h *Hub) registerJellyfinRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /System/Info/Public", h.jellyfinSystemInfo)
+	mux.HandleFunc("GET /Branding/Configuration", h.jellyfinBranding)
+	mux.HandleFunc("GET /Users/Public", h.jellyfinPublicUsers)
 	mux.HandleFunc("POST /Users/AuthenticateByName", h.jellyfinAuthenticate)
+	mux.HandleFunc("GET /System/Info", h.jellyfinProtected(h.jellyfinSystemInfoFull))
+	mux.HandleFunc("GET /Users/Me", h.jellyfinProtected(h.jellyfinUser))
+	mux.HandleFunc("GET /Users/{userID}", h.jellyfinProtected(h.jellyfinUser))
 	mux.HandleFunc("GET /Users/{userID}/Views", h.jellyfinProtected(h.jellyfinViews))
 	mux.HandleFunc("GET /Users/{userID}/Items", h.jellyfinProtected(h.jellyfinItems))
+	mux.HandleFunc("GET /Users/{userID}/Items/{itemID}", h.jellyfinProtected(h.jellyfinItemDetail))
 	mux.HandleFunc("GET /Users/{userID}/Items/Latest", h.jellyfinProtected(h.jellyfinLatest))
+	mux.HandleFunc("GET /Items/{itemID}", h.jellyfinProtected(h.jellyfinItemDetail))
+	mux.HandleFunc("GET /Shows/{seriesID}/Episodes", h.jellyfinProtected(h.jellyfinShowEpisodes))
 	mux.HandleFunc("GET /Items/{itemID}/Images/{kind}", h.jellyfinProtected(h.jellyfinImage))
 	mux.HandleFunc("GET /Items/{itemID}/Images/Backdrop/{index}", h.jellyfinProtected(h.jellyfinImage))
 	mux.HandleFunc("GET /Items/{itemID}/PlaybackInfo", h.jellyfinProtected(h.jellyfinPlaybackInfo))
 	mux.HandleFunc("POST /Items/{itemID}/PlaybackInfo", h.jellyfinProtected(h.jellyfinPlaybackInfo))
 	mux.HandleFunc("GET /Videos/{itemID}/stream", h.jellyfinProtected(h.jellyfinStream))
+	mux.HandleFunc("POST /Sessions/Capabilities", h.jellyfinProtected(h.jellyfinAcceptNoContent))
+	mux.HandleFunc("POST /Sessions/Capabilities/Full", h.jellyfinProtected(h.jellyfinAcceptNoContent))
+	mux.HandleFunc("POST /Sessions/Playing", h.jellyfinProtected(h.jellyfinReportProgress))
+	mux.HandleFunc("POST /Sessions/Playing/Progress", h.jellyfinProtected(h.jellyfinReportProgress))
+	mux.HandleFunc("POST /Sessions/Playing/Stopped", h.jellyfinProtected(h.jellyfinReportProgress))
+	mux.HandleFunc("POST /Users/{userID}/PlayedItems/{itemID}", h.jellyfinProtected(h.jellyfinMarkPlayed))
+	mux.HandleFunc("DELETE /Users/{userID}/PlayedItems/{itemID}", h.jellyfinProtected(h.jellyfinMarkUnplayed))
+	mux.HandleFunc("GET /DisplayPreferences/{id}", h.jellyfinProtected(h.jellyfinDisplayPreferences))
+	mux.HandleFunc("POST /DisplayPreferences/{id}", h.jellyfinProtected(h.jellyfinAcceptNoContent))
 }
 
 func (h *Hub) jellyfinSystemInfo(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +89,157 @@ func (h *Hub) jellyfinSystemInfo(w http.ResponseWriter, r *http.Request) {
 		"OperatingSystem": "linux", "StartupWizardCompleted": true,
 		"VeyraHubVersion": version,
 	})
+}
+
+// jellyfinBranding and jellyfinPublicUsers answer two unauthenticated calls
+// most Jellyfin/Emby clients (not just Veyra's own) make before login: a
+// branding check and a user-picker list. Returning defaults/an empty list
+// makes a generic client fall through to its normal manual-login form
+// instead of hanging or erroring on an unimplemented route.
+func (h *Hub) jellyfinBranding(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"LoginDisclaimer": "", "CustomCss": "", "SplashscreenEnabled": false})
+}
+
+func (h *Hub) jellyfinPublicUsers(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, []map[string]any{})
+}
+
+// jellyfinSystemInfoFull is the authenticated counterpart of
+// jellyfinSystemInfo (GET /System/Info/Public): the same identity, plus a
+// couple of fields generic clients check post-login (e.g. transcoding
+// support, which the hub never does — every stream is passed straight
+// through from its addon).
+func (h *Hub) jellyfinSystemInfoFull(w http.ResponseWriter, r *http.Request) {
+	state := h.store.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ServerName": "Veyra Hub", "ProductName": "Veyra Hub",
+		"Version": "10.11.8", "Id": state.NodeID,
+		"OperatingSystem": "linux", "StartupWizardCompleted": true,
+		"VeyraHubVersion": version,
+		"SupportsTranscoding": false, "SupportsHttps": false,
+		"LocalAddress": "", "WanAddress": "",
+	})
+}
+
+// jellyfinUser answers both GET /Users/Me and GET /Users/{userID}: the
+// signed-in user's profile, as a generic client fetches it right after
+// authenticating.
+func (h *Hub) jellyfinUser(w http.ResponseWriter, r *http.Request) {
+	user, _ := userFromContext(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Id": user.ID, "Name": user.Username,
+		"HasPassword": true, "HasConfiguredPassword": true, "HasConfiguredEasyPassword": false,
+		"EnableAutoLogin": false,
+		"Policy": map[string]any{
+			"IsAdministrator": user.Role == RoleAdmin, "IsDisabled": !user.Enabled,
+			"EnableLiveTvManagement": false, "EnableContentDeletion": false,
+		},
+		"Configuration": map[string]any{"PlayDefaultAudioTrack": true},
+	})
+}
+
+// jellyfinAcceptNoContent answers write-only calls a generic client makes
+// as part of its normal startup/playback flow but whose content the hub has
+// no use for (reported player capabilities, display-preference writes):
+// accepting them with 204 lets the client continue instead of treating an
+// unimplemented route as a hard failure.
+func (h *Hub) jellyfinAcceptNoContent(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// jellyfinDisplayPreferences answers a generic client's startup read of its
+// UI settings with a minimal, valid-shaped default so it doesn't treat a
+// 404 as corrupt state; the hub doesn't otherwise store per-client display
+// preferences.
+func (h *Hub) jellyfinDisplayPreferences(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Id": r.PathValue("id"), "ViewType": "movies", "SortBy": "SortName",
+		"RememberIndexing": false, "RememberSorting": false, "CustomPrefs": map[string]string{},
+	})
+}
+
+// jellyfinItemDetail answers GET /Items/{itemID} and GET
+// /Users/{userID}/Items/{itemID}: metadata for one item or one browsable
+// folder (library/smart collection/local source), decoded straight from the
+// hub's self-describing item id rather than a fresh catalog lookup, since
+// jellyfinItemsFromMetas already embedded everything a client needs.
+func (h *Hub) jellyfinItemDetail(w http.ResponseWriter, r *http.Request) {
+	item, err := decodeHubID(r.PathValue("itemID"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	switch item.Kind {
+	case "item":
+		writeJSON(w, http.StatusOK, jellyfinItem(item))
+	case "library", "smartCollection", "localSource":
+		writeJSON(w, http.StatusOK, map[string]any{
+			"Id": r.PathValue("itemID"), "Name": item.Name, "Type": "CollectionFolder",
+		})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// jellyfinShowEpisodes answers GET /Shows/{seriesID}/Episodes, the route
+// many generic clients use for a series' episode list instead of paging
+// GET /Users/{userID}/Items with ParentId=<series>.
+func (h *Hub) jellyfinShowEpisodes(w http.ResponseWriter, r *http.Request) {
+	series, err := decodeHubID(r.PathValue("seriesID"))
+	values := []map[string]any{}
+	if err == nil && series.Kind == "item" && series.MediaType == "series" {
+		meta, _ := h.fetchMeta(r.Context(), series.AddonID, "series", series.MediaID)
+		if episodes := h.jellyfinEpisodes(meta, series); episodes != nil {
+			values = episodes
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"Items": values, "TotalRecordCount": len(values)})
+}
+
+// jellyfinReportProgress answers the three playback-reporting calls a
+// generic client makes while and after playing (Sessions/Playing[/Progress
+// or /Stopped]): it decodes the same hub item id PlaybackInfo/stream handed
+// out and feeds the reported position into the same progress store the
+// native API's /progress routes use, so resume position stays in sync
+// however a client watches through the hub. Ticks are Jellyfin's playback
+// position unit: 100 nanoseconds each.
+func (h *Hub) jellyfinReportProgress(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		ItemId        string  `json:"ItemId"`
+		PositionTicks float64 `json:"PositionTicks"`
+	}
+	_ = decodeJSON(r, &input)
+	item, err := decodeHubID(input.ItemId)
+	if err == nil && item.MediaType != "" && item.MediaID != "" {
+		user, _ := userFromContext(r)
+		const ticksPerSecond = 10_000_000
+		_, _ = h.store.SetProgressForUser(user.ID, item.MediaType, item.MediaID, input.PositionTicks/ticksPerSecond, 0)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// jellyfinMarkPlayed/jellyfinMarkUnplayed answer the "mark watched"/"mark
+// unwatched" toggle (POST/DELETE /Users/{userID}/PlayedItems/{itemID}) a
+// generic client's UI offers outside of just playing something through.
+// Marking played stores a finished progress record — the same state
+// finishing a title through normal playback reporting would leave — rather
+// than adding a separate watched-flag concept to the store.
+func (h *Hub) jellyfinMarkPlayed(w http.ResponseWriter, r *http.Request) {
+	item, err := decodeHubID(r.PathValue("itemID"))
+	if err == nil && item.MediaType != "" && item.MediaID != "" {
+		user, _ := userFromContext(r)
+		_, _ = h.store.SetProgressForUser(user.ID, item.MediaType, item.MediaID, 1, 1)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"Played": true})
+}
+
+func (h *Hub) jellyfinMarkUnplayed(w http.ResponseWriter, r *http.Request) {
+	item, err := decodeHubID(r.PathValue("itemID"))
+	if err == nil && item.MediaType != "" && item.MediaID != "" {
+		user, _ := userFromContext(r)
+		_ = h.store.ClearProgressForUser(user.ID, item.MediaType, item.MediaID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"Played": false})
 }
 
 func (h *Hub) jellyfinAuthenticate(w http.ResponseWriter, r *http.Request) {
