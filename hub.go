@@ -187,31 +187,56 @@ func (h *Hub) Routes() http.Handler {
 	return requestLogger(securityHeaders(mux))
 }
 
-// requestLogger logs every request's method, path (never the query string —
-// a Jellyfin client's api_key access token travels there) and the response
-// status, at INFO level. This is deliberately unconditional rather than a
-// debug-only flag: on a self-hosted, single-tenant server the volume is low
-// and it is the only way to see what an external Jellyfin/Emby-style client
-// (Strand, or any other) actually calls and where the hub answers with a
-// 404 it doesn't yet implement.
+// requestLogger logs every request's method, path, a redacted query string
+// and the response's status and body size, at INFO level. This is
+// deliberately unconditional rather than a debug-only flag: on a
+// self-hosted, single-tenant server the volume is low and it is the only
+// way to see what an external Jellyfin/Emby-style client (Strand, or any
+// other) actually calls, whether the hub even recognizes the route (a
+// 404, or a 200 from the SPA's own catch-all when nothing more specific
+// matched), and whether its answer was actually empty.
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(recorder, r)
-		slog.Info("request", "method", r.Method, "path", r.URL.Path, "status", recorder.status)
+		slog.Info("request", "method", r.Method, "path", r.URL.Path, "query", redactedQuery(r), "status", recorder.status, "bytes", recorder.bytes)
 	})
 }
 
-// statusRecorder wraps a ResponseWriter to capture the status code a
-// handler wrote, since http.ResponseWriter itself doesn't expose it.
+// redactedQuery returns the request's query string with anything that
+// could be a bearer credential (an access token, however a client names
+// its query parameter for one) removed, so the rest — e.g. ParentId,
+// SearchTerm, ItemId — stays visible for debugging without ever logging a
+// secret.
+func redactedQuery(r *http.Request) string {
+	values := r.URL.Query()
+	for key := range values {
+		lower := strings.ToLower(key)
+		if strings.Contains(lower, "token") || strings.Contains(lower, "key") || strings.Contains(lower, "password") {
+			values.Set(key, "REDACTED")
+		}
+	}
+	return values.Encode()
+}
+
+// statusRecorder wraps a ResponseWriter to capture the status code and
+// response size a handler wrote, since http.ResponseWriter itself exposes
+// neither.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	bytes  int
 }
 
 func (s *statusRecorder) WriteHeader(status int) {
 	s.status = status
 	s.ResponseWriter.WriteHeader(status)
+}
+
+func (s *statusRecorder) Write(data []byte) (int, error) {
+	n, err := s.ResponseWriter.Write(data)
+	s.bytes += n
+	return n, err
 }
 
 // requireSession accepts any signed-in account (admin or viewer) and makes
