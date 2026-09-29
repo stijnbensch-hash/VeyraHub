@@ -184,7 +184,34 @@ func (h *Hub) Routes() http.Handler {
 	h.registerRequestRoutes(mux)
 	h.registerAuditRoutes(mux)
 	h.registerRecorderRoutes(mux)
-	return securityHeaders(mux)
+	return requestLogger(securityHeaders(mux))
+}
+
+// requestLogger logs every request's method, path (never the query string —
+// a Jellyfin client's api_key access token travels there) and the response
+// status, at INFO level. This is deliberately unconditional rather than a
+// debug-only flag: on a self-hosted, single-tenant server the volume is low
+// and it is the only way to see what an external Jellyfin/Emby-style client
+// (Strand, or any other) actually calls and where the hub answers with a
+// 404 it doesn't yet implement.
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(recorder, r)
+		slog.Info("request", "method", r.Method, "path", r.URL.Path, "status", recorder.status)
+	})
+}
+
+// statusRecorder wraps a ResponseWriter to capture the status code a
+// handler wrote, since http.ResponseWriter itself doesn't expose it.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(status int) {
+	s.status = status
+	s.ResponseWriter.WriteHeader(status)
 }
 
 // requireSession accepts any signed-in account (admin or viewer) and makes
