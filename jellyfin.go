@@ -171,7 +171,7 @@ func (h *Hub) jellyfinItemDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	switch item.Kind {
 	case "item":
-		writeJSON(w, http.StatusOK, jellyfinItem(item))
+		writeJSON(w, http.StatusOK, h.jellyfinItem(item))
 	case "library", "smartCollection", "localSource":
 		writeJSON(w, http.StatusOK, map[string]any{
 			"Id": r.PathValue("itemID"), "Name": item.Name, "Type": "CollectionFolder",
@@ -686,7 +686,7 @@ func (h *Hub) jellyfinItemsFromMetas(addonID string, metas []stremioMeta) []map[
 			continue
 		}
 		payload := hubItemID{Kind: "item", AddonID: addonID, MediaType: meta.Type, MediaID: meta.ID, Name: meta.Name, Overview: meta.Description, Poster: meta.Poster, Backdrop: meta.Background, Year: metaYear(meta)}
-		result = append(result, jellyfinItem(payload))
+		result = append(result, h.jellyfinItem(payload))
 	}
 	return result
 }
@@ -702,12 +702,24 @@ func (h *Hub) jellyfinEpisodes(meta stremioMeta, series hubItemID) []map[string]
 			name = video.Name
 		}
 		payload := hubItemID{Kind: "item", AddonID: series.AddonID, MediaType: "series", MediaID: video.ID, Name: name, Poster: video.Thumbnail, Backdrop: series.Backdrop, SeriesName: series.Name, SeriesID: encodeHubID(series), Season: video.Season, Episode: video.Episode}
-		result = append(result, jellyfinItem(payload))
+		result = append(result, h.jellyfinItem(payload))
 	}
 	return result
 }
 
-func jellyfinItem(item hubItemID) map[string]any {
+// jellyfinItem builds a single item the way a generic Jellyfin/Emby client
+// expects one, not just the way Veyra's own UI happens to consume it. Fields
+// like ServerId, IsFolder, MediaType, UserData and ProviderIds are exactly
+// what such a client (Strand included, which explicitly asks for
+// Fields=ProviderIds,MediaStreams,UserData on every Items call) checks
+// before it treats a returned item as valid and renders it — without them,
+// a client can silently drop every item even though the response itself
+// carries real data, which is what made "no results" persist in Strand
+// after Items stopped coming back empty. ProviderIds and UserData are sent
+// as empty-but-present values rather than omitted, since VeyraHub has
+// neither external provider ids nor (here, outside a per-user request) a
+// user's play state to report.
+func (h *Hub) jellyfinItem(item hubItemID) map[string]any {
 	typeName := "Movie"
 	if item.MediaType == "series" {
 		typeName = "Series"
@@ -715,7 +727,18 @@ func jellyfinItem(item hubItemID) map[string]any {
 	if item.Season > 0 {
 		typeName = "Episode"
 	}
-	value := map[string]any{"Id": encodeHubID(item), "Name": item.Name, "Type": typeName, "Overview": item.Overview}
+	isFolder := typeName == "Series"
+	value := map[string]any{
+		"Id": encodeHubID(item), "Name": item.Name, "Type": typeName, "Overview": item.Overview,
+		"ServerId": h.store.Snapshot().NodeID, "IsFolder": isFolder,
+		"ProviderIds": map[string]string{},
+		"UserData": map[string]any{
+			"Played": false, "PlayCount": 0, "IsFavorite": false, "PlaybackPositionTicks": 0,
+		},
+	}
+	if !isFolder {
+		value["MediaType"] = "Video"
+	}
 	if item.Year > 0 {
 		value["ProductionYear"] = item.Year
 	}
