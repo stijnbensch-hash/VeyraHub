@@ -418,12 +418,22 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if search != "" {
 		values = h.searchCatalogs(r.Context(), search, filter)
-	} else {
-		// No ParentId and no SearchTerm: a client browsing without having
-		// picked a library yet. Real Jellyfin servers answer this with the
-		// user's top-level items — here, the same library list Views
-		// returns — rather than an empty page that reads as "no content".
+	} else if includeTypes := r.URL.Query().Get("IncludeItemTypes"); includeTypes == "" {
+		// No ParentId, no SearchTerm and no type filter: a client browsing
+		// without having picked a library yet. Real Jellyfin servers answer
+		// this with the user's top-level items — here, the same library
+		// list Views returns — rather than an empty page that reads as "no
+		// content".
 		values = h.jellyfinViewItems()
+	} else {
+		// No ParentId or SearchTerm, but a type filter (e.g.
+		// IncludeItemTypes=Movie,Series): the client wants actual playable
+		// items of those types, not folders. Returning the CollectionFolder
+		// list from jellyfinViewItems here would always come back empty
+		// once filterJellyfinTypes strips out anything that isn't a
+		// Movie/Series/Episode, which is exactly what made an unscoped,
+		// type-filtered browse (as Strand does) look like an empty library.
+		values = h.jellyfinAllItems(r.Context(), filter, limit)
 	}
 
 	values = filterJellyfinTypes(values, r.URL.Query().Get("IncludeItemTypes"))
@@ -436,17 +446,19 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"Items": values, "TotalRecordCount": len(values)})
 }
 
-func (h *Hub) jellyfinLatest(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "Limit", 20)
-	user, _ := userFromContext(r)
-	filter := h.store.ContentFilterForUser(user.ID)
+// jellyfinAllItems collects up to limit playable items (movies/series) across
+// every enabled addon's catalogs, unfiltered by type — the caller applies
+// filterJellyfinTypes with whatever IncludeItemTypes the request specified.
+// Shared by jellyfinLatest and jellyfinItems' unscoped, type-filtered browse
+// fallback (no ParentId, no SearchTerm, but an IncludeItemTypes filter).
+func (h *Hub) jellyfinAllItems(ctx context.Context, filter ContentFilter, limit int) []map[string]any {
 	var values []map[string]any
 	for _, addon := range h.addonCatalog() {
 		if !addon.Enabled {
 			continue
 		}
 		for _, catalog := range addon.Catalogs {
-			metas, err := h.fetchCatalog(r.Context(), addon, catalog, "", 0)
+			metas, err := h.fetchCatalog(ctx, addon, catalog, "", 0)
 			if err == nil {
 				values = append(values, h.jellyfinItemsFromMetas(addon.ID, filterMetas(metas, filter))...)
 			}
@@ -458,6 +470,14 @@ func (h *Hub) jellyfinLatest(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	return values
+}
+
+func (h *Hub) jellyfinLatest(w http.ResponseWriter, r *http.Request) {
+	limit := queryInt(r, "Limit", 20)
+	user, _ := userFromContext(r)
+	filter := h.store.ContentFilterForUser(user.ID)
+	values := h.jellyfinAllItems(r.Context(), filter, limit)
 	values = filterJellyfinTypes(values, r.URL.Query().Get("IncludeItemTypes"))
 	if len(values) > limit {
 		values = values[:limit]
