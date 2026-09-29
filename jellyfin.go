@@ -433,7 +433,7 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 		// once filterJellyfinTypes strips out anything that isn't a
 		// Movie/Series/Episode, which is exactly what made an unscoped,
 		// type-filtered browse (as Strand does) look like an empty library.
-		values = h.jellyfinAllItems(r.Context(), filter, limit)
+		values = h.jellyfinAllItems(r.Context(), filter, includeTypes, limit)
 	}
 
 	values = filterJellyfinTypes(values, r.URL.Query().Get("IncludeItemTypes"))
@@ -447,11 +447,17 @@ func (h *Hub) jellyfinItems(w http.ResponseWriter, r *http.Request) {
 }
 
 // jellyfinAllItems collects up to limit playable items (movies/series) across
-// every enabled addon's catalogs, unfiltered by type — the caller applies
-// filterJellyfinTypes with whatever IncludeItemTypes the request specified.
-// Shared by jellyfinLatest and jellyfinItems' unscoped, type-filtered browse
-// fallback (no ParentId, no SearchTerm, but an IncludeItemTypes filter).
-func (h *Hub) jellyfinAllItems(ctx context.Context, filter ContentFilter, limit int) []map[string]any {
+// every enabled addon's catalogs, filtering each catalog's items by
+// includeTypes (Jellyfin's IncludeItemTypes, comma-separated) as they're
+// collected — not after the limit cutoff. Filtering only after truncating to
+// limit would let an early run of the wrong type (e.g. movies) crowd out a
+// later, differently-typed match (e.g. series) entirely, which is exactly
+// what made IncludeItemTypes=Series come back empty for Strand even though
+// IncludeItemTypes=Movie,Series (broader, so nothing got crowded out) did
+// not. Shared by jellyfinLatest and jellyfinItems' unscoped, type-filtered
+// browse fallback (no ParentId, no SearchTerm, but an IncludeItemTypes
+// filter).
+func (h *Hub) jellyfinAllItems(ctx context.Context, filter ContentFilter, includeTypes string, limit int) []map[string]any {
 	var values []map[string]any
 	for _, addon := range h.addonCatalog() {
 		if !addon.Enabled {
@@ -460,7 +466,8 @@ func (h *Hub) jellyfinAllItems(ctx context.Context, filter ContentFilter, limit 
 		for _, catalog := range addon.Catalogs {
 			metas, err := h.fetchCatalog(ctx, addon, catalog, "", 0)
 			if err == nil {
-				values = append(values, h.jellyfinItemsFromMetas(addon.ID, filterMetas(metas, filter))...)
+				items := filterJellyfinTypes(h.jellyfinItemsFromMetas(addon.ID, filterMetas(metas, filter)), includeTypes)
+				values = append(values, items...)
 			}
 			if len(values) >= limit {
 				break
@@ -477,8 +484,7 @@ func (h *Hub) jellyfinLatest(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "Limit", 20)
 	user, _ := userFromContext(r)
 	filter := h.store.ContentFilterForUser(user.ID)
-	values := h.jellyfinAllItems(r.Context(), filter, limit)
-	values = filterJellyfinTypes(values, r.URL.Query().Get("IncludeItemTypes"))
+	values := h.jellyfinAllItems(r.Context(), filter, r.URL.Query().Get("IncludeItemTypes"), limit)
 	if len(values) > limit {
 		values = values[:limit]
 	}
