@@ -27,6 +27,10 @@ type MediaCatalog struct {
 	Type      string   `json:"type"`
 	Name      string   `json:"name"`
 	Extra     []string `json:"extra,omitempty"`
+	// Genres are this catalog's own genre filter options, so a client
+	// (Veyra) can show the right filters for each catalogue rather than
+	// one global genre list (spec: "catalogue-specific genres").
+	Genres []string `json:"genres,omitempty"`
 }
 
 // MediaVideo represents an episode/video belonging to a media item.
@@ -112,6 +116,13 @@ func (h *Hub) mediaCatalogs() []MediaCatalog {
 		}
 
 		for _, catalog := range addon.Catalogs {
+			// Catalogue enable/disable: a disabled catalog stays fully
+			// configured (genres, position) but is excluded from what
+			// clients actually see here, same as a disabled addon is
+			// excluded above -- never removed, never affects siblings.
+			if !catalog.IsEnabled() {
+				continue
+			}
 			result = append(result, MediaCatalog{
 				AddonID:   addon.ID,
 				AddonName: addon.Name,
@@ -119,6 +130,7 @@ func (h *Hub) mediaCatalogs() []MediaCatalog {
 				Type:      catalog.Type,
 				Name:      catalog.Name,
 				Extra:     append([]string{}, catalog.Extra...),
+				Genres:    append([]string{}, catalog.Genres...),
 			})
 		}
 	}
@@ -182,7 +194,7 @@ func (h *Hub) mediaSearch(ctx context.Context, query string, filter ContentFilte
 		}
 
 		for _, catalog := range addon.Catalogs {
-			if !contains(catalog.Extra, "search") {
+			if !catalog.IsEnabled() || !contains(catalog.Extra, "search") {
 				continue
 			}
 

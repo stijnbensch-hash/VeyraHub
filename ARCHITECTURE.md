@@ -44,7 +44,48 @@ buildtargets en gegevensopslag van de Veyra-client.
   omgekeerd;
 - ondertitels zijn een eigen capability (`subtitles`), los van streams: een
   addon die geen `stream` levert kan toch ondertiteltracks aanleveren, en
-  omgekeerd — de hub combineert beide onafhankelijk van elkaar.
+  omgekeerd — de hub combineert beide onafhankelijk van elkaar;
+- capabilities worden nooit opgeslagen: `Addon.Capabilities()` berekent ze
+  telkens opnieuw uit `Resources`/`ConfigureURL`, zodat ze nooit los kunnen
+  raken van wat het manifest zelf meldt;
+- elke addonaanroep heeft een eigen deadline (`Hub.addonTimeout`, 10s
+  standaard), onafhankelijk van de algemene HTTP-clienttimeout — één trage
+  addon mag nooit de andere addons in dezelfde aanvraag blokkeren;
+  stream-/ondertitelaggregatie bevraagt addons al parallel (een goroutine
+  per addon); de eigen deadline bepaalt enkel hoe lang elke goroutine
+  maximaal wacht;
+- gezondheid is uitgebreid met `status` (`unknown`/`healthy`/`degraded`/
+  `timeout`/`offline`), `responseTimeMS`, `consecutiveFailures` en
+  `lastCheckedAt`, allemaal bijgewerkt in dezelfde observatie als
+  `reachable`/`lastSuccessAt`/`lastErrorAt` zodat ze nooit onderling kunnen
+  afwijken — nog steeds pure telemetrie, nooit een reden om een addon zelf
+  uit te schakelen.
+
+## Catalogusregister
+
+- elke catalogus (`AddonCatalog`) hoort bij precies één addon; de hub
+  identificeert een catalogus altijd als addon-id + catalogus-id +
+  mediatype — catalogus-id's zijn nooit globaal uniek verondersteld;
+- `Genres` zijn de waarden van de `genre`/`genres`-extra van díé ene
+  catalogus, rechtstreeks uit het manifest — nooit samengevoegd met de
+  genres van een andere catalogus, ook niet van dezelfde addon;
+- `Enabled` is een `*bool`: `nil` (een catalogus bewaard vóór dit veld
+  bestond) betekent "ingeschakeld" via `AddonCatalog.IsEnabled()` — de
+  achterwaarts-compatibele standaardwaarde zonder aparte migratiestap. Elke
+  catalogus die via een (ver)nieuwde manifestophaling binnenkomt krijgt
+  voortaan altijd een expliciete waarde;
+- volgorde is gewoon de volgorde van `Addon.Catalogs` — hetzelfde patroon
+  als addonvolgorde (`Store.collections`/addonlijst is ook gewoon
+  sliceVolgorde), dus geen apart ordeveld, geen aparte migratie;
+- een manifest-ververs (`refreshAddon`) voegt de vers opgehaalde
+  catalogilijst samen met de vorige via `mergeCatalogs`: een catalogus die
+  nog bestaat behoudt zijn `Enabled` en zijn positie maar krijgt de verse
+  naam/extra/genres; een nieuwe catalogus wordt achteraan toegevoegd,
+  standaard ingeschakeld; een catalogus die niet meer in het manifest
+  voorkomt vervalt. Mislukt de manifestophaling zelf, dan raakt
+  `refreshAddon` `existing` helemaal niet aan — de laatst bekende goede
+  data (inclusief catalogus aan/uit-status en -volgorde) blijft onverkort
+  bewaard.
 
 ## Mediatypes
 

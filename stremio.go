@@ -10,6 +10,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type stremioMeta struct {
@@ -55,16 +56,22 @@ func (h *Hub) fetchCatalog(ctx context.Context, addon Addon, catalog AddonCatalo
 	} else {
 		base.Path += ".json"
 	}
-	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	// Per-addon deadline (spec: one slow/broken addon must not block the
+	// whole request) -- bounds this one HTTP call regardless of how long
+	// the caller's own ctx still has left.
+	addonCtx, cancel := context.WithTimeout(ctx, h.addonTimeout)
+	defer cancel()
+	start := time.Now()
+	request, _ := http.NewRequestWithContext(addonCtx, http.MethodGet, base.String(), nil)
 	response, err := h.client.Do(request)
 	if err != nil {
-		h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+		h.recordAddonHealthTimed(addon.ID, false, sanitizeAddonError(err), time.Since(start))
 		return nil, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		err := fmt.Errorf("catalog HTTP %d", response.StatusCode)
-		h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+		h.recordAddonHealthTimed(addon.ID, false, sanitizeAddonError(err), time.Since(start))
 		return nil, err
 	}
 	var payload struct {
@@ -72,10 +79,10 @@ func (h *Hub) fetchCatalog(ctx context.Context, addon Addon, catalog AddonCatalo
 	}
 	err = json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&payload)
 	if err != nil {
-		h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+		h.recordAddonHealthTimed(addon.ID, false, sanitizeAddonError(err), time.Since(start))
 		return nil, err
 	}
-	h.recordAddonHealth(addon.ID, true, "")
+	h.recordAddonHealthTimed(addon.ID, true, "", time.Since(start))
 	h.catalogCache.set(cacheKey, payload.Metas)
 	return payload.Metas, nil
 }
@@ -101,23 +108,31 @@ func (h *Hub) fetchMetaWithSource(ctx context.Context, preferredAddonID, mediaTy
 
 			base.Path = path.Join(base.Path, "meta", mediaType, id+".json")
 
-			request, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+			// Per-addon deadline -- bounds this one call; cancel() runs when
+			// fetchMetaWithSource itself returns (either on this addon's
+			// success or after the whole two-pass loop below gives up).
+			addonCtx, cancel := context.WithTimeout(ctx, h.addonTimeout)
+			defer cancel()
+			start := time.Now()
+
+			request, err := http.NewRequestWithContext(addonCtx, http.MethodGet, base.String(), nil)
 			if err != nil {
 				continue
 			}
 
 			response, err := h.client.Do(request)
 			if err != nil {
-				h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				h.recordAddonHealthTimed(addon.ID, false, sanitizeAddonError(err), time.Since(start))
 				continue
 			}
 
 			if response.StatusCode < 200 || response.StatusCode >= 300 {
 				response.Body.Close()
-				h.recordAddonHealth(
+				h.recordAddonHealthTimed(
 					addon.ID,
 					false,
 					fmt.Sprintf("metadata request returned HTTP %d", response.StatusCode),
+					time.Since(start),
 				)
 				continue
 			}
@@ -130,16 +145,16 @@ func (h *Hub) fetchMetaWithSource(ctx context.Context, preferredAddonID, mediaTy
 			response.Body.Close()
 
 			if err != nil {
-				h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				h.recordAddonHealthTimed(addon.ID, false, sanitizeAddonError(err), time.Since(start))
 				continue
 			}
 
 			if payload.Meta.ID == "" {
-				h.recordAddonHealth(addon.ID, false, "metadata response contained no media item")
+				h.recordAddonHealthTimed(addon.ID, false, "metadata response contained no media item", time.Since(start))
 				continue
 			}
 
-			h.recordAddonHealth(addon.ID, true, "")
+			h.recordAddonHealthTimed(addon.ID, true, "", time.Since(start))
 			return payload.Meta, addon.ID, nil
 		}
 	}

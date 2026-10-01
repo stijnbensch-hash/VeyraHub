@@ -46,6 +46,27 @@ type Hub struct {
 	// this deployment: notify still records every notification in the
 	// poll-based feed, it just skips the push attempt.
 	apns *apnsClient
+
+	// addonTimeout bounds a single addon's own time to answer one request
+	// (stream/subtitle/catalog/meta), independent of h.client's overall
+	// 25s timeout: one slow or broken addon must never hold up every other
+	// addon being queried for the same request. Defaults to 10s in NewHub;
+	// override with SetAddonTimeout.
+	addonTimeout time.Duration
+}
+
+// defaultAddonTimeout is the per-addon request deadline used unless
+// SetAddonTimeout overrides it (see main.go's VEYRA_HUB_ADDON_TIMEOUT).
+const defaultAddonTimeout = 10 * time.Second
+
+// SetAddonTimeout overrides the per-addon request deadline. Not folded into
+// NewHub's signature for the same reason EnableAPNs isn't: that signature
+// is depended on by many existing tests and call sites, and a zero Duration
+// here would be meaningless anyway (NewHub already sets the real default).
+func (h *Hub) SetAddonTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		h.addonTimeout = timeout
+	}
 }
 
 // catalogCacheTTL/streamCacheTTL are short on purpose: long enough to
@@ -70,6 +91,11 @@ type addonManifest struct {
 		Name  string `json:"name"`
 		Extra []struct {
 			Name string `json:"name"`
+			// Options holds the extra option's own value list (e.g. the
+			// selectable genres for a "genre" extra) -- catalogue-specific
+			// genres (spec) are read from here, never pooled into one
+			// global list across catalogs/addons.
+			Options []string `json:"options"`
 		} `json:"extra"`
 	} `json:"catalogs"`
 	BehaviorHints struct {
@@ -134,6 +160,7 @@ func NewHub(store *Store, bootstrapUsername, bootstrapPassword string, client *h
 		catalogCache: newTTLCache[[]stremioMeta](catalogCacheTTL),
 		streamCache:  newTTLCache[[]HubStream](streamCacheTTL),
 		loginLimiter: newLoginLimiter(),
+		addonTimeout: defaultAddonTimeout,
 	}
 }
 
@@ -163,10 +190,14 @@ func (h *Hub) Routes() http.Handler {
 	mux.HandleFunc("DELETE /v1/sessions/{id}", h.requireAdmin(h.revokeSession))
 	mux.HandleFunc("GET /v1/addons", h.requireAdmin(h.listAddons))
 	mux.HandleFunc("POST /v1/addons", h.requireAdmin(h.addAddon))
+	mux.HandleFunc("GET /v1/addons/{id}", h.requireAdmin(h.getAddon))
 	mux.HandleFunc("POST /v1/addons/{id}/refresh", h.requireAdmin(h.refreshAddon))
 	mux.HandleFunc("PATCH /v1/addons/{id}", h.requireAdmin(h.patchAddon))
 	mux.HandleFunc("POST /v1/addons/{id}/move", h.requireAdmin(h.moveAddon))
 	mux.HandleFunc("DELETE /v1/addons/{id}", h.requireAdmin(h.deleteAddon))
+	mux.HandleFunc("GET /v1/catalogs", h.requireAdmin(h.listCatalogs))
+	mux.HandleFunc("PATCH /v1/addons/{id}/catalogs/{type}/{catalogID}", h.requireAdmin(h.patchCatalog))
+	mux.HandleFunc("POST /v1/addons/{id}/catalogs/{type}/{catalogID}/move", h.requireAdmin(h.moveCatalog))
 	mux.HandleFunc("GET /v1/users", h.requireAdmin(h.listUsers))
 	mux.HandleFunc("POST /v1/users", h.requireAdmin(h.addUser))
 	mux.HandleFunc("PATCH /v1/users/{id}", h.requireAdmin(h.patchUser))
@@ -316,11 +347,19 @@ func (h *Hub) addonCatalog() []Addon {
 // is always recorded against the admin's copy of the addon, regardless of
 // which account's request triggered the call.
 func (h *Hub) recordAddonHealth(id string, ok bool, message string) {
+	h.recordAddonHealthTimed(id, ok, message, 0)
+}
+
+// recordAddonHealthTimed is recordAddonHealth plus how long that one
+// observation took, for addon health's ResponseTimeMS (see
+// Store.RecordAddonHealthForUser). elapsed of 0 means "not measured",
+// matching recordAddonHealth's existing call sites, which don't.
+func (h *Hub) recordAddonHealthTimed(id string, ok bool, message string, elapsed time.Duration) {
 	adminID, found := h.store.AdminUserID()
 	if !found {
 		return
 	}
-	transition, addonName := h.store.RecordAddonHealthForUser(adminID, id, ok, message)
+	transition, addonName := h.store.RecordAddonHealthForUser(adminID, id, ok, message, elapsed)
 	switch transition {
 	case addonHealthBecameUnreachable:
 		h.notify(adminID, "Addon onbereikbaar", addonName+" is niet meer bereikbaar.")
@@ -597,7 +636,88 @@ func (h *Hub) invalidateAddonCaches() {
 }
 
 func (h *Hub) listAddons(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"addons": h.addonCatalog()})
+	writeJSON(w, http.StatusOK, map[string]any{"addons": addonViews(h.addonCatalog())})
+}
+
+// getAddon returns one addon's full detail (including its normalized
+// capabilities and catalog registry) -- the single-addon counterpart of
+// listAddons, for a client that already knows an id and wants to avoid
+// refetching the whole list.
+func (h *Hub) getAddon(w http.ResponseWriter, r *http.Request) {
+	admin, _ := r.Context().Value(ctxUserKey).(User)
+	addon, ok := h.store.FindAddonForUser(admin.ID, r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "Addon niet gevonden.")
+		return
+	}
+	writeJSON(w, http.StatusOK, addonView(addon))
+}
+
+// listCatalogs returns the normalized catalogue registry across every
+// addon -- every catalog, enabled or not, with its own genres and
+// position, for the admin dashboard and for clients that want the full
+// registry rather than mediaCatalogs()'s client-facing, enabled-only view.
+func (h *Hub) listCatalogs(w http.ResponseWriter, r *http.Request) {
+	type catalogEntry struct {
+		AddonID   string `json:"addonID"`
+		AddonName string `json:"addonName"`
+		AddonCatalog
+	}
+	var result []catalogEntry
+	for _, addon := range h.addonCatalog() {
+		for _, catalog := range addon.Catalogs {
+			result = append(result, catalogEntry{AddonID: addon.ID, AddonName: addon.Name, AddonCatalog: catalog})
+		}
+	}
+	if result == nil {
+		result = []catalogEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"catalogs": result})
+}
+
+// patchCatalog enables/disables one catalog, scoped to its addon -- the
+// catalog-level counterpart of patchAddon.
+func (h *Hub) patchCatalog(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := decodeJSON(r, &input); err != nil || input.Enabled == nil {
+		writeError(w, http.StatusBadRequest, "Geef enabled op.")
+		return
+	}
+	admin, _ := r.Context().Value(ctxUserKey).(User)
+	id, catalogType, catalogID := r.PathValue("id"), r.PathValue("type"), r.PathValue("catalogID")
+	if err := h.store.SetCatalogEnabledForUser(admin.ID, id, catalogType, catalogID, *input.Enabled); err != nil {
+		writeError(w, http.StatusNotFound, "Catalogus niet gevonden.")
+		return
+	}
+	h.invalidateAddonCaches()
+	action := "catalog.disable"
+	if *input.Enabled {
+		action = "catalog.enable"
+	}
+	h.audit(r, action, "catalog", id+"/"+catalogType+"/"+catalogID, "")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// moveCatalog reorders one catalog within its addon (direction -1/+1) --
+// the catalog-level counterpart of moveAddon.
+func (h *Hub) moveCatalog(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Direction int `json:"direction"`
+	}
+	if decodeJSON(r, &input) != nil || (input.Direction != -1 && input.Direction != 1) {
+		writeError(w, http.StatusBadRequest, "Gebruik richting -1 of 1.")
+		return
+	}
+	admin, _ := r.Context().Value(ctxUserKey).(User)
+	id, catalogType, catalogID := r.PathValue("id"), r.PathValue("type"), r.PathValue("catalogID")
+	if err := h.store.MoveCatalogForUser(admin.ID, id, catalogType, catalogID, input.Direction); err != nil {
+		writeError(w, http.StatusNotFound, "Catalogus niet gevonden.")
+		return
+	}
+	h.invalidateAddonCaches()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // resolvedAddonManifest holds everything addAddon/refreshAddon derive from
@@ -649,16 +769,26 @@ func (h *Hub) resolveAddonManifest(ctx context.Context, manifestURL *url.URL) (r
 			continue
 		}
 		extra := make([]string, 0, len(value.Extra))
+		var genres []string
 		for _, option := range value.Extra {
 			if option.Name != "" {
 				extra = append(extra, option.Name)
+			}
+			// Catalogue-specific genres: only this catalog's own "genre"/
+			// "genres" extra option, never a global list shared across
+			// catalogs that happen to both have one.
+			if option.Name == "genre" || option.Name == "genres" {
+				genres = append(genres, option.Options...)
 			}
 		}
 		name := strings.TrimSpace(value.Name)
 		if name == "" {
 			name = manifest.Name
 		}
-		catalogs = append(catalogs, AddonCatalog{ID: value.ID, Type: value.Type, Name: name, Extra: extra})
+		catalogs = append(catalogs, AddonCatalog{
+			ID: value.ID, Type: value.Type, Name: name, Extra: extra,
+			Genres: dedupeStrings(genres), Enabled: boolPtr(true),
+		})
 	}
 	baseURL := strings.TrimSuffix(base.String(), "/")
 	configureURL := ""
@@ -700,6 +830,10 @@ func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
 		BaseURL: resolved.BaseURL, ConfigureURL: resolved.ConfigureURL,
 		Resources: resolved.Resources, Catalogs: resolved.Catalogs,
 		Enabled: true, AddedAt: time.Now().UTC(), Reachable: true,
+		// Health.Status -> "unknown" until the hub actually calls this
+		// addon for the first time (spec: missing/new health fields get
+		// safe defaults, never a guessed "healthy").
+		Status: "unknown",
 	}
 	admin, _ := r.Context().Value(ctxUserKey).(User)
 	if err := h.store.PutAddonForUser(admin.ID, addon); err != nil {
@@ -708,7 +842,51 @@ func (h *Hub) addAddon(w http.ResponseWriter, r *http.Request) {
 	}
 	h.invalidateAddonCaches()
 	h.audit(r, "addon.add", "addon", addon.ID, addon.Name)
-	writeJSON(w, http.StatusCreated, addon)
+	writeJSON(w, http.StatusCreated, addonView(addon))
+}
+
+// mergeCatalogs combines a freshly-fetched catalog list with the
+// previously-stored one for the same addon, for refreshAddon: a catalog
+// that still exists keeps its stored Enabled state and its position
+// (spec: "preserve user catalogue ordering"/"preserve user catalogue
+// enabled/disabled state"), but always takes the freshly-fetched Name/
+// Extra/Genres in case those changed upstream. A catalog no longer present
+// upstream is dropped; a new one is appended at the end, enabled by
+// default (spec: "new catalogues should receive a sensible default
+// position without rearranging the user's existing ordering").
+func mergeCatalogs(existing, fresh []AddonCatalog) []AddonCatalog {
+	existingByKey := make(map[string]AddonCatalog, len(existing))
+	for _, catalog := range existing {
+		existingByKey[catalogKey(catalog.Type, catalog.ID)] = catalog
+	}
+
+	freshByKey := make(map[string]AddonCatalog, len(fresh))
+	for _, catalog := range fresh {
+		freshByKey[catalogKey(catalog.Type, catalog.ID)] = catalog
+	}
+
+	merged := make([]AddonCatalog, 0, len(fresh))
+	// Pass 1: existing catalogs that still exist, in their stored order,
+	// carrying over Enabled but taking the fresh Name/Extra/Genres.
+	for _, catalog := range existing {
+		key := catalogKey(catalog.Type, catalog.ID)
+		updated, stillExists := freshByKey[key]
+		if !stillExists {
+			continue
+		}
+		updated.Enabled = catalog.Enabled
+		merged = append(merged, updated)
+	}
+	// Pass 2: brand-new catalogs, appended in the order the manifest gave
+	// them, after everything that already existed.
+	for _, catalog := range fresh {
+		key := catalogKey(catalog.Type, catalog.ID)
+		if _, alreadyExisted := existingByKey[key]; alreadyExisted {
+			continue
+		}
+		merged = append(merged, catalog)
+	}
+	return merged
 }
 
 // refreshAddon re-fetches an already-registered addon's manifest.json and
@@ -750,14 +928,18 @@ func (h *Hub) refreshAddon(w http.ResponseWriter, r *http.Request) {
 	updated.BaseURL = resolved.BaseURL
 	updated.ConfigureURL = resolved.ConfigureURL
 	updated.Resources = resolved.Resources
-	updated.Catalogs = resolved.Catalogs
+	// A failed fetch already returned above (status != 0) without touching
+	// `existing` -- the last known-good manifest (including its catalog
+	// enabled/order state) is only ever replaced once a new one was
+	// successfully fetched and validated.
+	updated.Catalogs = mergeCatalogs(existing.Catalogs, resolved.Catalogs)
 	if err := h.store.PutAddonForUser(admin.ID, updated); err != nil {
 		writeError(w, http.StatusInternalServerError, "De addon kon niet worden opgeslagen.")
 		return
 	}
 	h.invalidateAddonCaches()
 	h.audit(r, "addon.refresh", "addon", updated.ID, updated.Name)
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, http.StatusOK, addonView(updated))
 }
 
 func (h *Hub) patchAddon(w http.ResponseWriter, r *http.Request) {
@@ -853,11 +1035,18 @@ func (h *Hub) aggregateStreams(ctx context.Context, mediaType, id string) []HubS
 		wg.Add(1)
 		go func(addon Addon) {
 			defer wg.Done()
-			values, err := h.fetchStreams(ctx, addon, mediaType, id)
+			// Per-addon deadline: one slow/broken addon must never hold up
+			// the other goroutines already racing it, nor the merge below
+			// waiting on this channel.
+			addonCtx, cancel := context.WithTimeout(ctx, h.addonTimeout)
+			defer cancel()
+			start := time.Now()
+			values, err := h.fetchStreams(addonCtx, addon, mediaType, id)
+			elapsed := time.Since(start)
 			if err != nil {
-				h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				h.recordAddonHealthTimed(addon.ID, false, sanitizeAddonError(err), elapsed)
 			} else {
-				h.recordAddonHealth(addon.ID, true, "")
+				h.recordAddonHealthTimed(addon.ID, true, "", elapsed)
 			}
 			results <- result{values, err}
 		}(addon)
@@ -963,11 +1152,15 @@ func (h *Hub) aggregateSubtitles(ctx context.Context, mediaType, id string) []Hu
 		wg.Add(1)
 		go func(addon Addon) {
 			defer wg.Done()
-			values, err := h.fetchSubtitles(ctx, addon, mediaType, id)
+			addonCtx, cancel := context.WithTimeout(ctx, h.addonTimeout)
+			defer cancel()
+			start := time.Now()
+			values, err := h.fetchSubtitles(addonCtx, addon, mediaType, id)
+			elapsed := time.Since(start)
 			if err != nil {
-				h.recordAddonHealth(addon.ID, false, sanitizeAddonError(err))
+				h.recordAddonHealthTimed(addon.ID, false, sanitizeAddonError(err), elapsed)
 			} else {
-				h.recordAddonHealth(addon.ID, true, "")
+				h.recordAddonHealthTimed(addon.ID, true, "", elapsed)
 			}
 			results <- result{values, err}
 		}(addon)
@@ -1058,6 +1251,23 @@ func isPrivateHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && (ip.IsPrivate() || ip.IsLoopback())
+}
+
+// dedupeStrings trims and deduplicates values, preserving first-seen order
+// and dropping anything blank. Used for catalogue genres (manifests
+// sometimes repeat a genre, or pad with empty strings).
+func dedupeStrings(values []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
 }
 
 func resourceNames(raw json.RawMessage) []string {

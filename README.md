@@ -87,12 +87,46 @@ maar zijn in deze versie niet allemaal gegarandeerd.
   zijn manifest, dan toont de beheerpagina een "Configureren"-knop die de
   addon zelf opent (bij Stremio-stijl addons op `<addon-url>/configure`). De
   hub bouwt daar bewust geen eigen instellingenformulier voor na.
+- `GET /v1/addons`/`GET /v1/addons/{id}` geven elke addon terug met een
+  afgeleid, nooit opgeslagen `capabilities`-veld (`catalog`/`meta`/`stream`/
+  `subtitles`/`configure`) -- rechtstreeks berekend uit de eigen
+  `resources` van de addon, nooit hardcoded op naam.
 - Elke keer dat de hub een addon aanroept voor een stream of catalogus
-  onthoudt hij of dat lukte: `reachable`, `lastSuccessAt`, `lastErrorAt` en
+  onthoudt hij of dat lukte: `reachable`, `lastSuccessAt`, `lastErrorAt`,
   een gesaneerde `lastError` (nooit de ruwe addon-URL of een query-string
-  met een sleutel erin) staan in `GET /v1/addons` en worden getoond in de
+  met een sleutel erin), plus `status` (`unknown`/`healthy`/`degraded`/
+  `timeout`/`offline`), `responseTimeMS`, `consecutiveFailures` en
+  `lastCheckedAt` staan in `GET /v1/addons` en worden getoond in de
   beheerpagina. Dit is puur telemetrie; enabled/disabled blijft een losse,
-  door de beheerder bepaalde schakelaar.
+  door de beheerder bepaalde schakelaar, en een reeks mislukte aanroepen
+  schakelt een addon nooit zelf uit.
+- Elke addonaanroep (catalogus, meta, stream, ondertitels) heeft een eigen
+  deadline (standaard 10s, `VEYRA_HUB_ADDON_TIMEOUT`/`-addon-timeout`): één
+  trage of kapotte addon blokkeert nooit de andere addons in dezelfde
+  aanvraag.
+
+## Catalogusregister: genres, aan/uit, volgorde
+
+- Elke catalogus van elke addon heeft een eigen, catalogus-specifieke
+  genrelijst (uit de `genre`/`genres`-extra van die catalogus in het
+  manifest) -- nooit gepoold tot één globale lijst. Zichtbaar via
+  `catalog.genres` op elke addon/catalogus en via `GET /v1/catalogs`/
+  `GET /api/v1/catalogs`.
+- Een catalogus kan individueel aan/uit, los van de addon en van andere
+  catalogi op diezelfde addon: `PATCH
+  /v1/addons/{id}/catalogs/{type}/{catalogID}` met `{"enabled": false}`.
+  Uitschakelen verwijdert niets, het sluit de catalogus enkel uit van wat
+  clients te zien krijgen.
+- De volgorde van catalogi binnen een addon is herschikbaar: `POST
+  /v1/addons/{id}/catalogs/{type}/{catalogID}/move` met `{"direction": -1}`
+  of `{"direction": 1}`. Die volgorde, en elke aan/uit-keuze, overleven een
+  herstart en een manifest-ververs (`POST /v1/addons/{id}/refresh`): een
+  catalogus die nog bestaat behoudt zijn positie en schakelaar, een nieuwe
+  catalogus wordt achteraan toegevoegd (standaard aan), en een mislukte
+  ververs laat de laatst bekende goede manifestdata volledig ongemoeid.
+- Catalogus-id's zijn alleen uniek per addon (nooit globaal uniek
+  verondersteld); de hub identificeert een catalogus altijd als
+  addon + catalogus-id + mediatype.
 
 ## VeyraHub Recorder (opnames)
 
@@ -165,7 +199,20 @@ Strand Recorder. Het is uitgeschakeld totdat je het opzet.
 - `GET /v1/sessions` — actieve sessies over alle accounts. *(beheer)*
 - `DELETE /v1/sessions/{id}` — een sessie/apparaat intrekken. *(beheer)*
 - `GET|POST /v1/addons` — addons bekijken/toevoegen. *(beheer)*
+- `GET /v1/addons/{id}` — één addon, incl. afgeleide `capabilities` en het
+  volledige catalogusregister. *(beheer)*
 - `PATCH|DELETE /v1/addons/{id}` — activeren, pauzeren of verwijderen. *(beheer)*
+- `POST /v1/addons/{id}/refresh` — manifest opnieuw ophalen; behoudt
+  catalogus aan/uit-status en -volgorde, laat de vorige data ongemoeid bij
+  een mislukte ververs. *(beheer)*
+- `POST /v1/addons/{id}/move` — addon hoger/lager in de bronvolgorde
+  (`{"direction": -1|1}`). *(beheer)*
+- `GET /v1/catalogs` — het volledige catalogusregister over alle addons,
+  met genres, aan/uit-status en volgorde. *(beheer)*
+- `PATCH /v1/addons/{id}/catalogs/{type}/{catalogID}` — één catalogus
+  aan/uit (`{"enabled": bool}`). *(beheer)*
+- `POST /v1/addons/{id}/catalogs/{type}/{catalogID}/move` — die catalogus
+  herschikken binnen zijn addon (`{"direction": -1|1}`). *(beheer)*
 - `GET|POST /v1/users` — persoonlijke kijkaccounts bekijken/toevoegen. *(beheer)*
 - `PATCH|DELETE /v1/users/{id}` — een kijkaccount pauzeren, wachtwoord
   resetten of verwijderen. *(beheer)*

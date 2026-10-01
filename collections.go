@@ -148,7 +148,7 @@ func (h *Hub) smartCollectionMetas(ctx context.Context, collection SmartCollecti
 			continue
 		}
 		for _, catalog := range addon.Catalogs {
-			if catalog.Type != collection.MediaType {
+			if !catalog.IsEnabled() || catalog.Type != collection.MediaType {
 				continue
 			}
 			metas, err := h.fetchCatalog(ctx, addon, catalog, "", 0)

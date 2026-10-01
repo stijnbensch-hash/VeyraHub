@@ -57,6 +57,74 @@ type Addon struct {
 	LastSuccessAt *time.Time `json:"lastSuccessAt,omitempty"`
 	LastErrorAt   *time.Time `json:"lastErrorAt,omitempty"`
 	LastError     string     `json:"lastError,omitempty"`
+
+	// Extended health tracking: ResponseTimeMS/ConsecutiveFailures/
+	// LastCheckedAt/Status are all set together, in
+	// RecordAddonHealthForUser, from the same observation that already
+	// updates Reachable/LastSuccessAt/LastErrorAt above — never a second,
+	// independently-timed write, so they can't disagree with it. Missing on
+	// an addon persisted before this field existed (old hub.json) simply
+	// decodes as the zero value, which a never-observed addon already is
+	// (Status omitempty hides it; the API/UI treat an empty Status as
+	// "unknown", same as a genuinely new addon — see addAddon).
+	ResponseTimeMS      int64      `json:"responseTimeMS,omitempty"`
+	ConsecutiveFailures int        `json:"consecutiveFailures,omitempty"`
+	LastCheckedAt       *time.Time `json:"lastCheckedAt,omitempty"`
+	// Status is one of "unknown" (never observed), "healthy", "degraded"
+	// (an isolated failure), "timeout" (the addon's own request deadline
+	// was hit) or "offline" (several failures in a row). Operational
+	// information only — a temporary failure here never disables or
+	// deletes the addon, that stays a separate, explicit admin action.
+	Status string `json:"status,omitempty"`
+}
+
+// AddonCapabilities is a normalized, resource-derived view of what an addon
+// can do. Deliberately never hardcoded by addon name — always read off
+// what the addon's own manifest declared (ARCHITECTURE.md "Addon
+// Registry": "capabilities zijn wat het manifest zelf opgeeft, nooit
+// hardcoded op naam"). An addon that declares nothing recognizable simply
+// has every field false/unknown rather than a guessed capability.
+type AddonCapabilities struct {
+	Catalog   bool `json:"catalog"`
+	Meta      bool `json:"meta"`
+	Stream    bool `json:"stream"`
+	Subtitles bool `json:"subtitles"`
+	Configure bool `json:"configure"`
+}
+
+// Capabilities derives this addon's capabilities from its own stored
+// Resources/ConfigureURL. Computed on demand rather than persisted, so it
+// can never drift out of sync with Resources — which stays the single
+// source of truth, exactly as before capabilities existed as their own
+// concept (every existing resource check in this codebase, e.g.
+// `contains(addon.Resources, "stream")`, keeps working unchanged).
+func (a Addon) Capabilities() AddonCapabilities {
+	return AddonCapabilities{
+		Catalog:   contains(a.Resources, "catalog"),
+		Meta:      contains(a.Resources, "meta"),
+		Stream:    contains(a.Resources, "stream"),
+		Subtitles: contains(a.Resources, "subtitles"),
+		Configure: a.ConfigureURL != "",
+	}
+}
+
+// AddonView is the shape an addon is exposed through the API in: the
+// stored Addon plus its derived (never persisted) Capabilities.
+type AddonView struct {
+	Addon
+	Capabilities AddonCapabilities `json:"capabilities"`
+}
+
+func addonView(addon Addon) AddonView {
+	return AddonView{Addon: addon, Capabilities: addon.Capabilities()}
+}
+
+func addonViews(addons []Addon) []AddonView {
+	result := make([]AddonView, 0, len(addons))
+	for _, addon := range addons {
+		result = append(result, addonView(addon))
+	}
+	return result
 }
 
 type AddonCatalog struct {
@@ -64,6 +132,37 @@ type AddonCatalog struct {
 	Type  string   `json:"type"`
 	Name  string   `json:"name"`
 	Extra []string `json:"extra,omitempty"`
+
+	// Genres are the values of this catalog's own "genre"/"genres" extra
+	// option, if its manifest declares one — catalogue-specific: two
+	// catalogs on the same addon, or on two different addons, can and do
+	// offer different genre lists, so this is never pooled into one
+	// global list.
+	Genres []string `json:"genres,omitempty"`
+
+	// Enabled is a *bool so old, already-persisted catalogs (which predate
+	// this field entirely) decode as nil and are treated as enabled by
+	// IsEnabled() below — the backward-compatible default this feature
+	// requires — without a separate migration pass. Every catalog
+	// resolved from a manifest from here on (add or refresh) always sets
+	// an explicit true/false, so nil only ever occurs for pre-existing data.
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// IsEnabled reports whether this catalog should be offered to clients.
+// nil (never explicitly set — i.e. persisted before this field existed)
+// defaults to enabled.
+func (c AddonCatalog) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+func boolPtr(value bool) *bool { return &value }
+
+// catalogKey uniquely identifies a catalog scoped to its addon: catalog
+// IDs are only unique per-addon-per-type, never globally (spec "Do not
+// assume catalogue IDs are globally unique between addons").
+func catalogKey(catalogType, catalogID string) string {
+	return catalogType + "\x00" + catalogID
 }
 
 // User is an authenticated account on the hub: either the private admin
@@ -691,7 +790,7 @@ const (
 // reports whether this call crossed a reachable/unreachable boundary (never
 // reported on the very first observation, which is just the addon settling
 // in rather than a real transition), along with the addon's display name.
-func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message string) (addonHealthTransition, string) {
+func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message string, elapsed time.Duration) (addonHealthTransition, string) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -712,12 +811,30 @@ func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message str
 		wasReachable := addon.Reachable
 
 		addon.Reachable = ok
+		addon.LastCheckedAt = &now
+		// elapsed is 0 for call sites that don't measure timing yet (the
+		// plain, non-timed recordAddonHealth wrapper) -- never overwrite a
+		// real measurement with a misleading 0ms.
+		if elapsed > 0 {
+			addon.ResponseTimeMS = elapsed.Milliseconds()
+		}
 
 		if ok {
 			addon.LastSuccessAt = &now
+			addon.ConsecutiveFailures = 0
+			addon.Status = "healthy"
 		} else {
 			addon.LastErrorAt = &now
 			addon.LastError = message
+			addon.ConsecutiveFailures++
+			switch {
+			case message == "time-out":
+				addon.Status = "timeout"
+			case addon.ConsecutiveFailures >= 3:
+				addon.Status = "offline"
+			default:
+				addon.Status = "degraded"
+			}
 		}
 
 		_ = s.persistLocked()
@@ -732,6 +849,78 @@ func (s *Store) RecordAddonHealthForUser(userID, id string, ok bool, message str
 	}
 
 	return addonHealthUnchanged, ""
+}
+
+// SetCatalogEnabledForUser toggles one catalog within one addon. It never
+// touches the addon itself (installed/enabled state), the catalog's own
+// position, or any other catalog -- disabling a catalog only means it stops
+// being offered to clients (mediaCatalogs/the Jellyfin bridge), the same
+// way SetAddonEnabledForUser stops an addon being called without removing
+// it.
+func (s *Store) SetCatalogEnabledForUser(userID, addonID, catalogType, catalogID string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	index := s.userAddonIndexLocked(userID)
+	if index < 0 {
+		return os.ErrNotExist
+	}
+
+	for i := range s.state.UserAddons[index].Addons {
+		addon := &s.state.UserAddons[index].Addons[i]
+		if addon.ID != addonID {
+			continue
+		}
+		for c := range addon.Catalogs {
+			if addon.Catalogs[c].Type != catalogType || addon.Catalogs[c].ID != catalogID {
+				continue
+			}
+			addon.Catalogs[c].Enabled = boolPtr(enabled)
+			return s.persistLocked()
+		}
+		return os.ErrNotExist
+	}
+
+	return os.ErrNotExist
+}
+
+// MoveCatalogForUser reorders one catalog within its addon's catalog list
+// (direction -1/+1), the same left/right-neighbour swap MoveAddonForUser
+// already uses for addon order -- catalogue order is simply catalog slice
+// order, exactly how addon order is already just addon slice order, so it
+// survives restart/container recreation/manifest refresh for free as long
+// as refreshAddon preserves existing catalog positions (see mergeCatalogs).
+func (s *Store) MoveCatalogForUser(userID, addonID, catalogType, catalogID string, direction int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	index := s.userAddonIndexLocked(userID)
+	if index < 0 {
+		return os.ErrNotExist
+	}
+
+	for i := range s.state.UserAddons[index].Addons {
+		addon := &s.state.UserAddons[index].Addons[i]
+		if addon.ID != addonID {
+			continue
+		}
+		catalogs := addon.Catalogs
+		for current := range catalogs {
+			if catalogs[current].Type != catalogType || catalogs[current].ID != catalogID {
+				continue
+			}
+			target := current + direction
+			if target < 0 || target >= len(catalogs) {
+				return nil
+			}
+			catalogs[current], catalogs[target] = catalogs[target], catalogs[current]
+			addon.Catalogs = catalogs
+			return s.persistLocked()
+		}
+		return os.ErrNotExist
+	}
+
+	return os.ErrNotExist
 }
 
 func (s *Store) DeleteAddonForUser(userID, id string) error {

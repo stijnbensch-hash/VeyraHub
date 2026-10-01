@@ -115,7 +115,7 @@ func (h *Hub) jellyfinSystemInfoFull(w http.ResponseWriter, r *http.Request) {
 		"ServerName": "Veyra Hub", "ProductName": "Veyra Hub",
 		"Version": "10.11.8", "Id": state.NodeID,
 		"OperatingSystem": "linux", "StartupWizardCompleted": true,
-		"VeyraHubVersion": version,
+		"VeyraHubVersion":     version,
 		"SupportsTranscoding": false, "SupportsHttps": false,
 		"LocalAddress": "", "WanAddress": "",
 	})
@@ -341,6 +341,9 @@ func (h *Hub) jellyfinViewItems() []map[string]any {
 			continue
 		}
 		for _, catalog := range addon.Catalogs {
+			if !catalog.IsEnabled() {
+				continue
+			}
 			id := encodeHubID(hubItemID{Kind: "library", AddonID: addon.ID, CatalogID: catalog.ID, MediaType: catalog.Type, Name: catalog.Name})
 			collectionType := "movies"
 			switch catalog.Type {
@@ -464,6 +467,9 @@ func (h *Hub) jellyfinAllItems(ctx context.Context, filter ContentFilter, includ
 			continue
 		}
 		for _, catalog := range addon.Catalogs {
+			if !catalog.IsEnabled() {
+				continue
+			}
 			metas, err := h.fetchCatalog(ctx, addon, catalog, "", 0)
 			if err == nil {
 				items := filterJellyfinTypes(h.jellyfinItemsFromMetas(addon.ID, filterMetas(metas, filter)), includeTypes)
@@ -667,7 +673,7 @@ func (h *Hub) searchCatalogs(ctx context.Context, query string, filter ContentFi
 			continue
 		}
 		for _, catalog := range addon.Catalogs {
-			if !contains(catalog.Extra, "search") {
+			if !catalog.IsEnabled() || !contains(catalog.Extra, "search") {
 				continue
 			}
 			metas, err := h.fetchCatalog(ctx, addon, catalog, query, 0)
@@ -763,7 +769,7 @@ func (h *Hub) catalogByID(addonID, catalogID, mediaType string) (Addon, AddonCat
 			continue
 		}
 		for _, catalog := range addon.Catalogs {
-			if catalog.ID == catalogID && catalog.Type == mediaType {
+			if catalog.ID == catalogID && catalog.Type == mediaType && catalog.IsEnabled() {
 				return addon, catalog, true
 			}
 		}

@@ -38,6 +38,12 @@ func main() {
 		// cadence); set backupInterval to 0 to disable entirely.
 		backupInterval = flag.Duration("backup-interval", envDuration("VEYRA_HUB_BACKUP_INTERVAL", 6*time.Hour), "how often to write a hub.json backup snapshot (0 disables)")
 		backupKeep     = flag.Int("backup-keep", envInt("VEYRA_HUB_BACKUP_KEEP", 28), "how many backup snapshots to retain")
+
+		// addonTimeout bounds how long any single addon gets to answer one
+		// catalog/meta/stream/subtitle request; one slow or broken addon
+		// must never hold up the others. 10s by default (addonTimeout.md
+		// / ARCHITECTURE.md).
+		addonTimeout = flag.Duration("addon-timeout", envDuration("VEYRA_HUB_ADDON_TIMEOUT", defaultAddonTimeout), "per-addon request deadline")
 	)
 	flag.Parse()
 
@@ -69,6 +75,7 @@ func main() {
 
 	hub := NewHub(store, *username, *token, nil)
 	hub.EnableAPNs(apnsConfig)
+	hub.SetAddonTimeout(*addonTimeout)
 
 	backupCtx, cancelBackups := context.WithCancel(context.Background())
 	defer cancelBackups()
